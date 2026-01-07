@@ -1,0 +1,68 @@
+"""
+Global constants, parameters, and hyperparameters for algobot_v2.
+
+All configuration values, thresholds, and parameters should be defined here.
+
+NOTE: This is a template file. Copy this to parameters.py and fill in your actual values.
+The real parameters.py file is gitignored to protect sensitive information.
+"""
+
+# Godel Terminal Configuration
+GODEL_URL = "https://app.godelterminal.com/"
+GODEL_USERNAME = "your_email@example.com"  # Replace with your Godel Terminal email
+GODEL_PASSWORD = "your_password"  # Replace with your Godel Terminal password
+
+# Schwab API Configuration
+SCHWAB_APP_KEY = "your_schwab_app_key"  # Replace with your Schwab API app key
+SCHWAB_APP_SECRET = "your_schwab_app_secret"  # Replace with your Schwab API app secret
+
+# Token Management Parameters
+TOKEN_REFRESH_INTERVAL_MINUTES = 29  # Refresh tokens every 29 minutes
+TOKEN_EXPIRY_BUFFER_MINUTES = 1  # Refresh 1 minute before actual expiry
+TOKEN_FILE_NAME = "schwab_tokens.json"
+
+# Database Configuration (Local SQLite for now)
+DATABASE_TYPE = "sqlite"  # Options: "sqlite", "mysql" (for future use)
+DATABASE_NAME = "algobot_trades.db"
+DATABASE_PATH = None  # Will be set to project root / database_name
+
+# Trading Parameters
+STOP_LOSS_PERCENT = 2.0  # Default stop loss percentage
+TAKE_PROFIT_PERCENT = 4.0  # Default take profit percentage
+MAX_HOLD_TIME_MINUTES = 60  # Maximum time to hold a position
+MAX_POSITION_SIZE_DOLLARS = 1000.0  # Maximum position size in dollars per trade
+
+# PRT Strategy Parameters (prob_up thresholds)
+PROB_UP_MIN_LONG = 0.55  # Minimum prob_up for long positions
+PROB_UP_MIN_SHORT = 0.45  # Maximum prob_up for short positions (prob_up < this)
+PROB_UP_EDGE_THRESHOLD = 0.00001  # Minimum edge for consideration
+
+# MOST Command Parameters
+MOST_TAB = "ACTIVE"  # Tab to use: ACTIVE, GAINERS, LOSERS, VALUE
+MOST_LIMIT = 75  # Number of results (10, 25, 50, 75, 100)
+PRT_MAX_TICKERS = 75  # Maximum tickers that can be sent to PRT
+
+# Market Hours Parameters
+MARKET_OPEN_DELAY_MINUTES = 1  # Wait after market open before trading
+MARKET_CLOSE_BUFFER_MINUTES = 5  # Stop trading this many minutes before close
+
+# Order Parameters
+USE_LIMIT_ORDERS = True  # Use limit orders instead of market orders
+LIMIT_ORDER_TIMEOUT_SECONDS = 10  # Timeout for limit orders
+LIMIT_ORDER_MAX_ATTEMPTS = 3  # Max attempts before using market order
+LIMIT_ORDER_PRICE_OFFSET_PERCENT = 0.02  # Initial offset from quote (2 basis points)
+LIMIT_ORDER_ADJUSTMENT_PERCENT = 0.05  # Price adjustment per attempt (5 basis points)
+
+# Godel Terminal Timeouts
+TERMINAL_LOAD_TIMEOUT = 15  # Seconds to wait for terminal to load
+COMMAND_EXECUTION_TIMEOUT = 30  # Seconds to wait for command execution
+WINDOW_DETECTION_TIMEOUT = 10  # Seconds to wait for new window creation
+
+# Browser Configuration
+BROWSER_HEADLESS = False  # Set to True for headless mode
+BROWSER_WINDOW_SIZE = (1920, 1080)
+
+# Logging Configuration
+LOG_LEVEL = "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
+LOG_FILE = "algobot.log"
+

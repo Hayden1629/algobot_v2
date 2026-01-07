@@ -1,0 +1,208 @@
+"""
+Order management operations for Schwab Trader API.
+Handles order creation, cancellation, and status checking.
+"""
+import requests
+import time
+from typing import Dict, Optional
+from loguru import logger
+from schwab.account.client import AccountClient
+from schwab.market_data.client import MarketDataClient
+from constants.parameters import (
+    USE_LIMIT_ORDERS,
+    LIMIT_ORDER_TIMEOUT_SECONDS,
+    LIMIT_ORDER_MAX_ATTEMPTS,
+    LIMIT_ORDER_PRICE_OFFSET_PERCENT,
+    LIMIT_ORDER_ADJUSTMENT_PERCENT
+)
+
+
+class OrderManager:
+    """
+    Manages order operations for Schwab Trader API.
+    Handles order creation, cancellation, and status checking.
+    """
+    
+    def __init__(self, account_client: AccountClient, market_data_client: MarketDataClient):
+        """
+        Initialize order manager.
+        
+        Args:
+            account_client: Account client instance
+            market_data_client: Market data client instance
+        """
+        self.account_client = account_client
+        self.market_data_client = market_data_client
+    
+    def create_order(self, order_payload: Dict, max_retries: int = 5) -> Dict:
+        """
+        Create an order via Schwab API.
+        Includes retry logic with exponential backoff for rate limiting.
+        
+        Args:
+            order_payload: Order payload dictionary
+            max_retries: Maximum number of retry attempts
+        
+        Returns:
+            dict: API response with order details
+        """
+        self.account_client._update_headers()
+        
+        # Add Content-Type header for POST requests
+        headers = self.account_client.headers.copy()
+        headers["Content-Type"] = "application/json"
+        
+        url = f"{self.account_client.base_url}/accounts/{self.account_client.account_hash_value}/orders"
+        
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=order_payload,
+                    timeout=10
+                )
+                
+                if response.status_code in [200, 201]:
+                    response_data = response.json() if response.text else {}
+                    
+                    # Check for order ID in response headers (Location header)
+                    if 'Location' in response.headers:
+                        location = response.headers['Location']
+                        order_id = location.split('/')[-1]
+                        response_data['orderId'] = order_id
+                    
+                    logger.info(f"Order created successfully (Status {response.status_code}, Order ID: {response_data.get('orderId', 'N/A')})")
+                    return response_data
+                elif response.status_code == 429:
+                    # Rate limited - retry with exponential backoff
+                    if attempt < max_retries - 1:
+                        wait_time = 2.0 * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"Rate limited (429) creating order (attempt {attempt + 1}/{max_retries}), waiting {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        self.account_client._update_headers()
+                        headers = self.account_client.headers.copy()
+                        headers["Content-Type"] = "application/json"
+                        continue
+                    else:
+                        error_msg = f"Failed to create order: 429 Too Many Requests (after {max_retries} attempts)"
+                        logger.error(error_msg)
+                        return {'error': error_msg, 'status_code': 429}
+                else:
+                    error_msg = f"Failed to create order: {response.status_code}"
+                    if response.text:
+                        error_msg += f" - {response.text}"
+                    logger.error(error_msg)
+                    return {'error': error_msg, 'status_code': response.status_code}
+                    
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2.0 * (2 ** attempt)
+                    logger.warning(f"Connection error creating order (attempt {attempt + 1}/{max_retries}), waiting {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    self.account_client._update_headers()
+                    headers = self.account_client.headers.copy()
+                    headers["Content-Type"] = "application/json"
+                    continue
+                else:
+                    logger.error(f"Error creating order after {max_retries} attempts: {e}")
+                    return {'error': str(e)}
+            except Exception as e:
+                logger.error(f"Error creating order: {e}")
+                return {'error': str(e)}
+        
+        return {'error': f'Failed after {max_retries} attempts'}
+    
+    def cancel_order(self, order_id: str) -> Dict:
+        """
+        Cancel an order.
+        
+        Args:
+            order_id: Order ID to cancel
+        
+        Returns:
+            dict: API response
+        """
+        self.account_client._update_headers()
+        
+        url = f"{self.account_client.base_url}/accounts/{self.account_client.account_hash_value}/orders/{order_id}"
+        
+        try:
+            response = requests.delete(url, headers=self.account_client.headers, timeout=10)
+            
+            if response.status_code in [200, 204]:
+                logger.info(f"Order {order_id} cancelled successfully")
+                return {'success': True}
+            else:
+                error_msg = f"Failed to cancel order {order_id}: {response.status_code}"
+                if response.text:
+                    error_msg += f" - {response.text}"
+                logger.error(error_msg)
+                return {'error': error_msg, 'status_code': response.status_code}
+                
+        except Exception as e:
+            logger.error(f"Error cancelling order {order_id}: {e}")
+            return {'error': str(e)}
+    
+    def create_market_order(self, ticker: str, instruction: str, quantity: int) -> Dict:
+        """
+        Create a market order.
+        
+        Args:
+            ticker: Stock ticker symbol
+            instruction: Order instruction ('BUY', 'SELL', 'SELL_SHORT', 'BUY_TO_COVER')
+            quantity: Number of shares
+        
+        Returns:
+            dict: API response with order details
+        """
+        order_payload = {
+            "orderType": "MARKET",
+            "session": "NORMAL",
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "orderLegCollection": [{
+                "instruction": instruction.upper(),
+                "quantity": int(quantity),
+                "instrument": {
+                    "symbol": ticker.upper(),
+                    "assetType": "EQUITY"
+                }
+            }]
+        }
+        
+        logger.info(f"Creating market order: {ticker} {instruction} {quantity} shares")
+        return self.create_order(order_payload)
+    
+    def create_limit_order(self, ticker: str, instruction: str, quantity: int, price: float) -> Dict:
+        """
+        Create a limit order.
+        
+        Args:
+            ticker: Stock ticker symbol
+            instruction: Order instruction ('BUY', 'SELL', 'SELL_SHORT', 'BUY_TO_COVER')
+            quantity: Number of shares
+            price: Limit price
+        
+        Returns:
+            dict: API response with order details
+        """
+        order_payload = {
+            "orderType": "LIMIT",
+            "price": str(round(price, 4) if price < 1.0 else round(price, 2)),
+            "session": "NORMAL",
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "orderLegCollection": [{
+                "instruction": instruction.upper(),
+                "quantity": int(quantity),
+                "instrument": {
+                    "symbol": ticker.upper(),
+                    "assetType": "EQUITY"
+                }
+            }]
+        }
+        
+        logger.info(f"Creating limit order: {ticker} {instruction} {quantity} shares @ ${price:.4f}")
+        return self.create_order(order_payload)
+
