@@ -65,4 +65,5 @@ BROWSER_WINDOW_SIZE = (1920, 1080)
 # Logging Configuration
 LOG_LEVEL = "INFO"  # Options: DEBUG, INFO, WARNING, ERROR
 LOG_FILE = "algobot.log"
+SHOW_ORDER_OUTPUT = False  # If True, show detailed order placement logs. If False, only show summaries.
 

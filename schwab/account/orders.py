@@ -13,7 +13,8 @@ from constants.parameters import (
     LIMIT_ORDER_TIMEOUT_SECONDS,
     LIMIT_ORDER_MAX_ATTEMPTS,
     LIMIT_ORDER_PRICE_OFFSET_PERCENT,
-    LIMIT_ORDER_ADJUSTMENT_PERCENT
+    LIMIT_ORDER_ADJUSTMENT_PERCENT,
+    SHOW_ORDER_OUTPUT
 )
 
 
@@ -72,7 +73,8 @@ class OrderManager:
                         order_id = location.split('/')[-1]
                         response_data['orderId'] = order_id
                     
-                    logger.info(f"Order created successfully (Status {response.status_code}, Order ID: {response_data.get('orderId', 'N/A')})")
+                    if SHOW_ORDER_OUTPUT:
+                        logger.info(f"Order created successfully (Status {response.status_code}, Order ID: {response_data.get('orderId', 'N/A')})")
                     return response_data
                 elif response.status_code == 429:
                     # Rate limited - retry without delay
@@ -286,6 +288,7 @@ class OrderManager:
             }]
         }
         
-        logger.info(f"Creating stop loss order: {ticker} {instruction} {quantity} shares @ ${stop_price:.4f} stop (entry: ${entry_price:.4f}, {stop_loss_percent}% loss)")
+        if SHOW_ORDER_OUTPUT:
+            logger.info(f"Creating stop loss order: {ticker} {instruction} {quantity} shares @ ${stop_price:.4f} stop (entry: ${entry_price:.4f}, {stop_loss_percent}% loss)")
         return self.create_order(order_payload)
 

@@ -7,7 +7,7 @@ from loguru import logger
 from schwab.account.client import AccountClient
 from schwab.market_data.client import MarketDataClient
 from schwab.account.orders import OrderManager
-from constants.parameters import USE_LIMIT_ORDERS, STOP_LOSS_PERCENT
+from constants.parameters import USE_LIMIT_ORDERS, STOP_LOSS_PERCENT, SHOW_ORDER_OUTPUT
 
 
 class TradeExecutor:
@@ -186,7 +186,8 @@ class TradeExecutor:
             logger.error(f"Could not get limit price for {ticker}")
             return {'success': False, 'error': 'Could not get limit price'}
         
-        logger.info(f"Executing {direction} {ticker}: {shares} shares @ ${limit_price:.2f} limit")
+        if SHOW_ORDER_OUTPUT:
+            logger.info(f"Executing {direction} {ticker}: {shares} shares @ ${limit_price:.2f} limit")
         
         try:
             # Determine order instruction based on direction
@@ -214,7 +215,8 @@ class TradeExecutor:
             
             if 'orderId' in result or 'success' in result:
                 order_id = result.get('orderId', result.get('order_id', 'unknown'))
-                logger.info(f"✓ Order placed: {direction} {ticker} {shares} shares @ ${limit_price:.2f} (Order ID: {order_id})")
+                if SHOW_ORDER_OUTPUT:
+                    logger.info(f"✓ Order placed: {direction} {ticker} {shares} shares @ ${limit_price:.2f} (Order ID: {order_id})")
                 return {
                     'success': True,
                     'order_id': order_id,
@@ -258,7 +260,7 @@ class TradeExecutor:
         logger.info("=" * 60)
         logger.info("Trade Execution")
         logger.info("=" * 60)
-        logger.info(f"Executing {len(sized_trades)} trade(s)")
+        logger.info(f"Placing {len(sized_trades)} trade(s)...")
         
         execution_results = []
         pending_orders = []
@@ -266,7 +268,8 @@ class TradeExecutor:
         # Phase 1: Place all orders
         for i, sized_trade in enumerate(sized_trades, 1):
             ticker = sized_trade.get('ticker', 'Unknown')
-            logger.info(f"[{i}/{len(sized_trades)}] Executing trade for {ticker}...")
+            if SHOW_ORDER_OUTPUT:
+                logger.info(f"[{i}/{len(sized_trades)}] Executing trade for {ticker}...")
             
             result = self.execute_trade(sized_trade)
             execution_results.append(result)
@@ -281,7 +284,8 @@ class TradeExecutor:
             
         # Phase 2: Check order fills and retry if needed
         if pending_orders:
-            logger.info(f"Checking {len(pending_orders)} order(s) for fills...")
+            if SHOW_ORDER_OUTPUT:
+                logger.info(f"Checking {len(pending_orders)} order(s) for fills...")
             import time
             time.sleep(2)  # Wait a moment for orders to process
             
@@ -295,7 +299,8 @@ class TradeExecutor:
                 status = order_status.get('status', '').upper()
                 
                 if status == 'FILLED':
-                    logger.info(f"✓ Order filled immediately for {ticker} (Order ID: {order_id})")
+                    if SHOW_ORDER_OUTPUT:
+                        logger.info(f"✓ Order filled immediately for {ticker} (Order ID: {order_id})")
                     pending['result']['filled'] = True
                     filled_immediately.append(pending)
             
@@ -319,7 +324,8 @@ class TradeExecutor:
                     status = order_status.get('status', '').upper()
                     
                     if status == 'FILLED':
-                        logger.info(f"✓ Order filled for {ticker} (Order ID: {order_id})")
+                        if SHOW_ORDER_OUTPUT:
+                            logger.info(f"✓ Order filled for {ticker} (Order ID: {order_id})")
                         # Update result to indicate fill
                         pending['result']['filled'] = True
                         # Get actual fill price if available
@@ -347,7 +353,8 @@ class TradeExecutor:
                     break
                 
                 if attempt < max_retries - 1:
-                    logger.info(f"Waiting {retry_delay}s before checking {len(still_pending)} pending order(s) again...")
+                    if SHOW_ORDER_OUTPUT:
+                        logger.info(f"Waiting {retry_delay}s before checking {len(still_pending)} pending order(s) again...")
                     time.sleep(retry_delay)
                     
                     # Retry unfilled orders with new prices
@@ -363,7 +370,8 @@ class TradeExecutor:
                             status = order_status.get('status', '').upper()
                             
                             if status == 'FILLED':
-                                logger.info(f"✓ Order filled for {ticker} (Order ID: {old_order_id})")
+                                if SHOW_ORDER_OUTPUT:
+                                    logger.info(f"✓ Order filled for {ticker} (Order ID: {old_order_id})")
                                 pending['result']['filled'] = True
                                 filled_during_retry.append(pending)
                                 continue
@@ -384,7 +392,8 @@ class TradeExecutor:
                                 if cancel_result.get('error'):
                                     error_msg = cancel_result.get('error', '').upper()
                                     if 'FILLED' in error_msg and ('CANNOT' in error_msg or 'CANNOT BE CANCELED' in error_msg):
-                                        logger.info(f"✓ Order for {ticker} was filled (cancel failed: order already filled)")
+                                        if SHOW_ORDER_OUTPUT:
+                                            logger.info(f"✓ Order for {ticker} was filled (cancel failed: order already filled)")
                                         pending['result']['filled'] = True
                                         filled_during_retry.append(pending)
                                         continue
@@ -404,7 +413,8 @@ class TradeExecutor:
                                     error_msg = cancel_result.get('error', '').upper()
                                     if 'FILLED' in error_msg and ('CANNOT' in error_msg or 'CANNOT BE CANCELED' in error_msg):
                                         # Order was filled - treat as success
-                                        logger.info(f"✓ Order for {ticker} was filled (cancel failed: order already filled)")
+                                        if SHOW_ORDER_OUTPUT:
+                                            logger.info(f"✓ Order for {ticker} was filled (cancel failed: order already filled)")
                                         pending['result']['filled'] = True
                                         filled_during_retry.append(pending)
                                         # Don't place new order - this one is done
@@ -421,7 +431,8 @@ class TradeExecutor:
                         if 'orderId' in result or 'success' in result:
                             new_order_id = result.get('orderId', result.get('order_id', 'unknown'))
                             pending['result']['order_id'] = new_order_id
-                            logger.info(f"✓ Retry order placed for {ticker} (Order ID: {new_order_id})")
+                            if SHOW_ORDER_OUTPUT:
+                                logger.info(f"✓ Retry order placed for {ticker} (Order ID: {new_order_id})")
                         else:
                             logger.error(f"✗ Retry failed for {ticker}: {result.get('error', 'Unknown error')}")
                             # Mark as failed
@@ -435,7 +446,8 @@ class TradeExecutor:
                         if 'orderId' in result or 'success' in result:
                             new_order_id = result.get('orderId', result.get('order_id', 'unknown'))
                             pending['result']['order_id'] = new_order_id
-                            logger.info(f"✓ Retry order placed for {ticker} (Order ID: {new_order_id})")
+                            if SHOW_ORDER_OUTPUT:
+                                logger.info(f"✓ Retry order placed for {ticker} (Order ID: {new_order_id})")
                         else:
                             logger.error(f"✗ Retry failed for {ticker}: {result.get('error', 'Unknown error')}")
                             # Mark as failed
@@ -481,7 +493,8 @@ class TradeExecutor:
                 )
                 
                 if 'orderId' in result or 'success' in result:
-                    logger.info(f"✓ Market order placed for {ticker}")
+                    if SHOW_ORDER_OUTPUT:
+                        logger.info(f"✓ Market order placed for {ticker}")
                     pending['result']['filled'] = True
                     pending['result']['order_id'] = result.get('orderId', result.get('order_id', 'unknown'))
                 else:

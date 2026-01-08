@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from loguru import logger
 import pytz
-from constants.parameters import MAX_HOLD_TIME_MINUTES
+from constants.parameters import MAX_HOLD_TIME_MINUTES, SHOW_ORDER_OUTPUT
 
 
 class TradeTracker:
@@ -48,7 +48,8 @@ class TradeTracker:
             'age_minutes': 0.0,
             'stop_loss_order_id': None  # Track stop loss order ID
         }
-        logger.debug(f"Added trade to tracker: {ticker} at {entry_time}")
+        if SHOW_ORDER_OUTPUT:
+            logger.debug(f"Added trade to tracker: {ticker} at {entry_time}")
     
     def remove_trade(self, ticker: str) -> None:
         """
@@ -123,7 +124,8 @@ class TradeTracker:
         ticker_upper = ticker.upper()
         if ticker_upper in self.trades:
             self.trades[ticker_upper]['stop_loss_order_id'] = order_id
-            logger.debug(f"Set stop loss order ID for {ticker}: {order_id}")
+            if SHOW_ORDER_OUTPUT:
+                logger.debug(f"Set stop loss order ID for {ticker}: {order_id}")
     
     def get_stop_loss_order_id(self, ticker: str) -> Optional[str]:
         """

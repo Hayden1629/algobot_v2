@@ -27,7 +27,8 @@ from constants.parameters import (
     PRT_MAX_TICKERS,
     MAX_POSITIONS,
     STOP_LOSS_PERCENT,
-    DO_OPPOSITE
+    DO_OPPOSITE,
+    SHOW_ORDER_OUTPUT
 )
 from constants.blacklist import filter_blacklisted_tickers
 from strategy.trade_tracker import TradeTracker
@@ -716,7 +717,8 @@ class RollingStrategy:
                                     # Track the trade
                                     if ticker:
                                         self.trade_tracker.add_trade(ticker)
-                                        logger.debug(f"Tracking new trade: {ticker} ({direction}, {shares} shares)")
+                                        if SHOW_ORDER_OUTPUT:
+                                            logger.debug(f"Tracking new trade: {ticker} ({direction}, {shares} shares)")
                                     
                                     # Place stop loss order
                                     if entry_price > 0:
@@ -736,7 +738,8 @@ class RollingStrategy:
                                         if stop_loss_result.get('orderId') or stop_loss_result.get('success'):
                                             stop_loss_order_id = stop_loss_result.get('orderId', stop_loss_result.get('order_id', 'unknown'))
                                             self.trade_tracker.set_stop_loss_order_id(ticker, stop_loss_order_id)
-                                            logger.info(f"✓ Stop loss order placed for {ticker} (Order ID: {stop_loss_order_id}, {STOP_LOSS_PERCENT}% loss)")
+                                            if SHOW_ORDER_OUTPUT:
+                                                logger.info(f"✓ Stop loss order placed for {ticker} (Order ID: {stop_loss_order_id}, {STOP_LOSS_PERCENT}% loss)")
                                         else:
                                             logger.warning(f"Failed to place stop loss order for {ticker}: {stop_loss_result.get('error', 'Unknown error')}")
                             

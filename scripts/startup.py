@@ -232,6 +232,149 @@ def close_all_positions_before_market_close(
             logger.info(f"Closed short position: {symbol} {short_qty} shares")
 
 
+def verify_stop_losses_for_all_positions(
+    account_client: AccountClient,
+    order_manager: OrderManager,
+    trade_tracker: TradeTracker
+) -> None:
+    """
+    Verify that all active positions have outstanding stop loss orders.
+    If a position is missing a stop loss, attempt to place one.
+    
+    Args:
+        account_client: Account client instance
+        order_manager: Order manager instance
+        trade_tracker: Trade tracker instance
+    """
+    try:
+        logger.info("=" * 60)
+        logger.info("Verifying stop loss orders for all positions...")
+        
+        # Get all positions
+        positions = account_client.get_positions()
+        if not positions:
+            logger.info("No positions to verify")
+            return
+        
+        # Get all open orders to check for stop loss orders
+        open_orders = account_client.get_all_open_orders()
+        
+        # Create a map of ticker -> stop loss order info
+        stop_loss_orders_by_ticker = {}
+        for order in open_orders:
+            order_type = order.get('orderType', '').upper()
+            if order_type == 'STOP':
+                # Extract ticker from order
+                order_legs = order.get('orderLegCollection', [])
+                if order_legs:
+                    instrument = order_legs[0].get('instrument', {})
+                    ticker = instrument.get('symbol', '').upper()
+                    if ticker:
+                        stop_loss_orders_by_ticker[ticker] = {
+                            'order_id': order.get('orderId'),
+                            'status': order.get('status', 'UNKNOWN')
+                        }
+        
+        # Check each position
+        missing_stops = []
+        positions_with_stops = []
+        
+        for pos in positions:
+            symbol = pos.get('instrument', {}).get('symbol', '').upper()
+            if not symbol:
+                continue
+            
+            long_qty = pos.get('longQuantity', 0) or 0
+            short_qty = pos.get('shortQuantity', 0) or 0
+            
+            if long_qty == 0 and short_qty == 0:
+                continue  # Skip flat positions
+            
+            # Check if position has a stop loss order
+            has_stop_loss = symbol in stop_loss_orders_by_ticker
+            
+            if has_stop_loss:
+                stop_info = stop_loss_orders_by_ticker[symbol]
+                logger.info(f"✓ {symbol}: Has stop loss order (ID: {stop_info['order_id']}, Status: {stop_info['status']})")
+                positions_with_stops.append(symbol)
+            else:
+                logger.warning(f"✗ {symbol}: MISSING stop loss order!")
+                missing_stops.append({
+                    'ticker': symbol,
+                    'long_qty': long_qty,
+                    'short_qty': short_qty
+                })
+        
+        logger.info(f"Stop loss verification: {len(positions_with_stops)} with stops, {len(missing_stops)} missing")
+        
+        # Attempt to place missing stop loss orders
+        if missing_stops:
+            logger.warning(f"Attempting to place stop loss orders for {len(missing_stops)} position(s)...")
+            
+            for missing in missing_stops:
+                ticker = missing['ticker']
+                long_qty = missing['long_qty']
+                short_qty = missing['short_qty']
+                
+                # Get current price for the position
+                market_data_client = MarketDataClient()
+                quote_data = market_data_client.get_quote_full(ticker)
+                
+                if not quote_data:
+                    logger.error(f"Could not get quote for {ticker} to place stop loss")
+                    continue
+                
+                # Extract price
+                last_price = (
+                    quote_data.get('quote', {}).get('lastPrice') or
+                    quote_data.get('regular', {}).get('regularMarketLastPrice') or
+                    quote_data.get('lastPrice')
+                )
+                
+                if not last_price:
+                    logger.error(f"Could not get price for {ticker} to place stop loss")
+                    continue
+                
+                entry_price = float(last_price)
+                
+                # Determine direction and quantity
+                if long_qty > 0:
+                    direction = 'LONG'
+                    quantity = int(long_qty)
+                    stop_instruction = 'SELL'
+                elif short_qty > 0:
+                    direction = 'SHORT'
+                    quantity = int(short_qty)
+                    stop_instruction = 'BUY_TO_COVER'
+                else:
+                    continue
+                
+                # Place stop loss order
+                from constants.parameters import STOP_LOSS_PERCENT
+                logger.warning(f"Placing stop loss for {ticker} ({direction}, {quantity} shares @ ${entry_price:.2f})")
+                stop_loss_result = order_manager.create_stop_loss_order(
+                    ticker,
+                    stop_instruction,
+                    quantity,
+                    entry_price,
+                    STOP_LOSS_PERCENT
+                )
+                
+                if stop_loss_result.get('orderId') or stop_loss_result.get('success'):
+                    stop_loss_order_id = stop_loss_result.get('orderId', stop_loss_result.get('order_id', 'unknown'))
+                    trade_tracker.set_stop_loss_order_id(ticker, stop_loss_order_id)
+                    logger.info(f"✓ Placed stop loss order for {ticker} (Order ID: {stop_loss_order_id})")
+                else:
+                    logger.error(f"✗ Failed to place stop loss for {ticker}: {stop_loss_result.get('error', 'Unknown error')}")
+        
+        logger.info("=" * 60)
+        
+    except Exception as e:
+        logger.error(f"Error verifying stop losses: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 def supervisor_loop(account_client: AccountClient, market_data_client: MarketDataClient) -> str:
     """
     Supervisor loop that runs when market is closed.
@@ -371,12 +514,55 @@ def trading_loop(
             else:
                 logger.warning(f"Cycle had errors: {results.get('errors', [])}")
             
-            # Wait before next cycle
+            # Verify all positions have stop loss orders before waiting
+            verify_stop_losses_for_all_positions(account_client, order_manager, trade_tracker)
+            
+            # Wait before next cycle with periodic checks
             # CRITICAL: Use PRT_RECHECK_INTERVAL_SECONDS parameter (not hardcoded)
+            # Break up the wait into smaller chunks to allow market monitoring and account size checks
             wait_seconds = PRT_RECHECK_INTERVAL_SECONDS
             logger.warning(f"⏸️  Waiting {wait_seconds} seconds ({wait_seconds / 60:.1f} minutes) before next PRT cycle...")
             logger.warning(f"   (Parameter PRT_RECHECK_INTERVAL_SECONDS = {PRT_RECHECK_INTERVAL_SECONDS})")
-            time.sleep(wait_seconds)
+            
+            # Break wait into 30-second chunks to allow monitoring
+            chunk_size = 30  # Check every 30 seconds
+            remaining_seconds = wait_seconds
+            
+            while remaining_seconds > 0:
+                # Sleep for chunk_size seconds or remaining time, whichever is smaller
+                sleep_time = min(chunk_size, remaining_seconds)
+                time.sleep(sleep_time)
+                remaining_seconds -= sleep_time
+                
+                # Check market status during wait
+                is_open, message = market_data_client.is_market_open(delay_minutes=0)
+                if not is_open:
+                    logger.warning(f"Market closed during wait: {message}")
+                    break
+                
+                # Check if market is about to close
+                eastern = pytz.timezone('US/Eastern')
+                now_eastern = datetime.now(eastern)
+                current_time = now_eastern.time()
+                buffer_hour = 15
+                buffer_minute = 60 - MARKET_CLOSE_BUFFER_MINUTES
+                buffer_time = datetime.strptime(f"{buffer_hour:02d}:{buffer_minute:02d}", "%H:%M").time()
+                
+                if current_time >= buffer_time:
+                    logger.warning(f"Market closing soon (within {MARKET_CLOSE_BUFFER_MINUTES} minutes) - closing all positions")
+                    close_all_positions_before_market_close(order_manager, account_client, reason="market close")
+                    break
+                
+                # Check and log account size periodically during wait
+                now = datetime.now()
+                if now - last_account_check >= account_check_interval:
+                    logger.info("Checking account size during wait...")
+                    account_monitor.log_account_size()
+                    last_account_check = now
+                
+                # Log remaining wait time
+                if remaining_seconds > 0:
+                    logger.debug(f"  {remaining_seconds} seconds remaining in wait period...")
             
     except KeyboardInterrupt:
         logger.info("Trading loop interrupted by user")
