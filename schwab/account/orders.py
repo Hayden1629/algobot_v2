@@ -37,7 +37,7 @@ class OrderManager:
     def create_order(self, order_payload: Dict, max_retries: int = 5) -> Dict:
         """
         Create an order via Schwab API.
-        Includes retry logic with exponential backoff for rate limiting.
+        Includes retry logic for failed requests.
         
         Args:
             order_payload: Order payload dictionary
@@ -75,11 +75,9 @@ class OrderManager:
                     logger.info(f"Order created successfully (Status {response.status_code}, Order ID: {response_data.get('orderId', 'N/A')})")
                     return response_data
                 elif response.status_code == 429:
-                    # Rate limited - retry with exponential backoff
+                    # Rate limited - retry without delay
                     if attempt < max_retries - 1:
-                        wait_time = 2.0 * (2 ** attempt)  # Exponential backoff
-                        logger.warning(f"Rate limited (429) creating order (attempt {attempt + 1}/{max_retries}), waiting {wait_time:.1f}s...")
-                        time.sleep(wait_time)
+                        logger.warning(f"Rate limited (429) creating order (attempt {attempt + 1}/{max_retries}), retrying immediately...")
                         self.account_client._update_headers()
                         headers = self.account_client.headers.copy()
                         headers["Content-Type"] = "application/json"
@@ -204,5 +202,90 @@ class OrderManager:
         }
         
         logger.info(f"Creating limit order: {ticker} {instruction} {quantity} shares @ ${price:.4f}")
+        return self.create_order(order_payload)
+    
+    def get_order_status(self, order_id: str) -> Dict:
+        """
+        Get order status and details.
+        
+        Args:
+            order_id: Order ID to check
+        
+        Returns:
+            dict: Order details including status, or error dict
+        """
+        self.account_client._update_headers()
+        
+        url = f"{self.account_client.base_url}/accounts/{self.account_client.account_hash_value}/orders/{order_id}"
+        
+        try:
+            response = requests.get(url, headers=self.account_client.headers, timeout=10)
+            
+            if response.status_code == 200:
+                order_data = response.json()
+                return order_data
+            elif response.status_code == 404:
+                logger.warning(f"Order {order_id} not found (404)")
+                return {'error': 'Order not found', 'status_code': 404}
+            else:
+                error_msg = f"Failed to get order status {order_id}: {response.status_code}"
+                if response.text:
+                    error_msg += f" - {response.text}"
+                logger.error(error_msg)
+                return {'error': error_msg, 'status_code': response.status_code}
+                
+        except Exception as e:
+            logger.error(f"Error getting order status {order_id}: {e}")
+            return {'error': str(e)}
+    
+    def create_stop_loss_order(self, ticker: str, instruction: str, quantity: int, 
+                               entry_price: float, stop_loss_percent: float) -> Dict:
+        """
+        Create a stop loss order.
+        
+        Args:
+            ticker: Stock ticker symbol
+            instruction: Order instruction ('SELL' for LONG, 'BUY_TO_COVER' for SHORT)
+            quantity: Number of shares
+            entry_price: Entry price of the position
+            stop_loss_percent: Stop loss percentage (e.g., 0.2 for 0.2%)
+        
+        Returns:
+            dict: API response with order details
+        """
+        # Calculate stop loss price
+        if instruction.upper() in ['SELL', 'SELL_SHORT']:
+            # For LONG positions: stop loss is below entry price
+            stop_price = entry_price * (1 - stop_loss_percent / 100)
+        elif instruction.upper() in ['BUY_TO_COVER', 'BUY']:
+            # For SHORT positions: stop loss is above entry price
+            stop_price = entry_price * (1 + stop_loss_percent / 100)
+        else:
+            logger.error(f"Invalid instruction for stop loss: {instruction}")
+            return {'error': f'Invalid instruction: {instruction}'}
+        
+        # Round to appropriate decimal places (Schwab API requirement)
+        if stop_price >= 1.0:
+            stop_price = round(stop_price, 2)
+        else:
+            stop_price = round(stop_price, 4)
+        
+        order_payload = {
+            "orderType": "STOP",
+            "stopPrice": str(stop_price),
+            "session": "NORMAL",
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "orderLegCollection": [{
+                "instruction": instruction.upper(),
+                "quantity": int(quantity),
+                "instrument": {
+                    "symbol": ticker.upper(),
+                    "assetType": "EQUITY"
+                }
+            }]
+        }
+        
+        logger.info(f"Creating stop loss order: {ticker} {instruction} {quantity} shares @ ${stop_price:.4f} stop (entry: ${entry_price:.4f}, {stop_loss_percent}% loss)")
         return self.create_order(order_payload)
 

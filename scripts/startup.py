@@ -10,20 +10,23 @@ import signal
 import atexit
 from datetime import datetime, timedelta
 import pytz
+import os
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from database.init import init_database, database_exists
-from schwab.tokens.storage import token_file_exists
+from schwab.tokens.storage import token_file_exists, get_token_file_path
 from schwab.tokens.acquisition import acquire_tokens
 from constants.parameters import (
     GODEL_USERNAME,
     GODEL_PASSWORD,
     MARKET_OPEN_DELAY_MINUTES,
     MARKET_CLOSE_BUFFER_MINUTES,
-    MAX_HOLD_TIME_MINUTES
+    MAX_HOLD_TIME_MINUTES,
+    ACCOUNT_SIZE_CHECK_INTERVAL_MINUTES,
+    PRT_RECHECK_INTERVAL_SECONDS
 )
 from core.controller import GodelTerminalController
 from schwab.account.client import AccountClient
@@ -31,6 +34,7 @@ from schwab.market_data.client import MarketDataClient
 from schwab.account.orders import OrderManager
 from strategy.rolling_strategy import RollingStrategy
 from strategy.trade_tracker import TradeTracker
+from monitoring.account_size import AccountSizeMonitor
 
 
 def check_prerequisites() -> bool:
@@ -53,15 +57,36 @@ def check_prerequisites() -> bool:
         logger.info("✓ Database exists")
     
     # Check tokens
-    if not token_file_exists():
-        logger.warning("Token file not found")
+    token_file = get_token_file_path()
+    token_file_exists_flag = token_file_exists()
+    token_file_too_old = False
+    
+    if token_file_exists_flag:
+        # Check if token file is more than 29 minutes old
+        try:
+            file_mtime = os.path.getmtime(token_file)
+            file_age_minutes = (time.time() - file_mtime) / 60
+            if file_age_minutes > 29:
+                token_file_too_old = True
+                logger.warning(f"Token file is {file_age_minutes:.1f} minutes old (older than 29 minutes)")
+            else:
+                logger.info(f"✓ Token file exists and is {file_age_minutes:.1f} minutes old")
+        except Exception as e:
+            logger.warning(f"Could not check token file age: {e}, treating as missing")
+            token_file_too_old = True
+    
+    if not token_file_exists_flag or token_file_too_old:
+        if token_file_too_old:
+            logger.warning("Token file is too old, re-acquiring tokens...")
+        else:
+            logger.warning("Token file not found")
         logger.info("Starting token acquisition...")
         if not acquire_tokens():
             logger.error("Failed to acquire tokens")
             return False
         logger.info("✓ Tokens acquired")
     else:
-        logger.info("✓ Token file exists")
+        logger.info("✓ Token file exists and is valid")
     
     return True
 
@@ -96,14 +121,93 @@ def close_all_positions_before_market_close(
     """
     Close all positions before market close (emergency use).
     Follows RULES.md: Must close positions within 5 minutes of market close.
+    Cancels all outstanding orders (including stop losses) before closing positions.
     
     Args:
         order_manager: Order manager instance
         account_client: Account client instance
         reason: Reason for closing positions
     """
-    logger.warning(f"Closing all positions: {reason}")
+    logger.error("=" * 60)
+    logger.error(f"EMERGENCY: Closing all positions - {reason}")
+    logger.error("=" * 60)
     
+    # CRITICAL STEP 1: Cancel ALL outstanding orders FIRST (including stop losses)
+    # This MUST happen before attempting to close positions
+    logger.error("STEP 1: CANCELING ALL OUTSTANDING ORDERS (INCLUDING STOP LOSSES)")
+    logger.error("=" * 60)
+    
+    canceled_count = 0
+    failed_count = 0
+    
+    try:
+        logger.error("Calling get_all_open_orders()...")
+        open_orders = account_client.get_all_open_orders()
+        logger.error(f"API returned: {len(open_orders) if open_orders else 0} order(s)")
+        
+        if not open_orders:
+            logger.error("WARNING: get_all_open_orders() returned empty list - this may be incorrect!")
+            logger.error("Attempting to proceed with position closure anyway...")
+        elif len(open_orders) > 0:
+            logger.error(f"FOUND {len(open_orders)} OUTSTANDING ORDER(S) - CANCELING ALL NOW")
+            
+            for idx, order in enumerate(open_orders, 1):
+                order_id = order.get('orderId') or order.get('order_id')
+                order_status = order.get('status', 'UNKNOWN')
+                symbol = order.get('orderLegCollection', [{}])[0].get('instrument', {}).get('symbol', 'UNKNOWN')
+                
+                logger.error(f"[{idx}/{len(open_orders)}] CANCELING: Order {order_id} for {symbol} (status: {order_status})")
+                
+                if not order_id:
+                    logger.error(f"  ✗ SKIPPED: Order missing orderId - {order}")
+                    failed_count += 1
+                    continue
+                
+                try:
+                    cancel_result = order_manager.cancel_order(str(order_id))
+                    if cancel_result and cancel_result.get('success'):
+                        canceled_count += 1
+                        logger.error(f"  ✓ SUCCESS: Canceled order {order_id}")
+                    else:
+                        error = cancel_result.get('error', 'Unknown error') if cancel_result else 'No response'
+                        error_upper = str(error).upper()
+                        
+                        if any(term in error_upper for term in ['FILLED', 'NOT FOUND', '404', 'CANNOT BE CANCELED', 'ALREADY EXECUTED', 'ALREADY FILLED']):
+                            logger.error(f"  → Order {order_id} already filled/executed (OK to skip)")
+                        else:
+                            failed_count += 1
+                            logger.error(f"  ✗ FAILED: Could not cancel order {order_id}: {error}")
+                except Exception as e:
+                    failed_count += 1
+                    logger.error(f"  ✗ EXCEPTION canceling order {order_id}: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+            
+            logger.error(f"ORDER CANCELLATION SUMMARY: {canceled_count} canceled, {failed_count} failed")
+            
+            # CRITICAL: Wait to ensure cancellations are processed
+            if canceled_count > 0:
+                logger.error(f"Waiting 3 seconds for {canceled_count} cancellation(s) to process...")
+                time.sleep(3)
+            elif len(open_orders) > 0:
+                logger.error("No orders were successfully canceled - waiting 2 seconds anyway...")
+                time.sleep(2)
+            else:
+                time.sleep(1)
+        else:
+            logger.error("No outstanding orders found")
+    except Exception as e:
+        logger.error(f"CRITICAL EXCEPTION in order cancellation: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        logger.error("Continuing with position closure despite error...")
+        time.sleep(2)  # Wait anyway
+    
+    logger.error("=" * 60)
+    logger.error("STEP 2: NOW CLOSING ALL POSITIONS")
+    logger.error("=" * 60)
+    
+    # Step 2: Close all positions
     positions = account_client.get_positions()
     if not positions:
         logger.info("No positions to close")
@@ -192,9 +296,20 @@ def trading_loop(
     logger.info(f"Market open delay: {MARKET_OPEN_DELAY_MINUTES} minutes")
     logger.info(f"Market close buffer: {MARKET_CLOSE_BUFFER_MINUTES} minutes")
     logger.info(f"Max hold time: {MAX_HOLD_TIME_MINUTES} minutes")
+    logger.info(f"PRT recheck interval: {PRT_RECHECK_INTERVAL_SECONDS} seconds ({PRT_RECHECK_INTERVAL_SECONDS / 60:.1f} minutes)")
     logger.info("=" * 60)
     
-    cycle_interval_seconds = 60  # Run strategy cycle every 60 seconds
+    cycle_interval_seconds = PRT_RECHECK_INTERVAL_SECONDS
+    logger.info(f"Cycle interval set to: {cycle_interval_seconds} seconds")
+    
+    # Initialize account size monitor
+    account_monitor = AccountSizeMonitor(account_client)
+    last_account_check = datetime.now()
+    account_check_interval = timedelta(minutes=ACCOUNT_SIZE_CHECK_INTERVAL_MINUTES)
+    
+    # Log initial account size
+    logger.info("Logging initial account size...")
+    account_monitor.log_account_size()
     
     try:
         while True:
@@ -240,6 +355,13 @@ def trading_loop(
                                 order_manager.create_market_order(symbol, "BUY_TO_COVER", int(short_qty))
                                 trade_tracker.remove_trade(symbol)
             
+            # Check and log account size periodically
+            now = datetime.now()
+            if now - last_account_check >= account_check_interval:
+                logger.info("Checking account size...")
+                account_monitor.log_account_size()
+                last_account_check = now
+            
             # Execute rolling strategy cycle
             logger.info("Executing rolling strategy cycle...")
             results = strategy.execute_cycle()
@@ -250,8 +372,11 @@ def trading_loop(
                 logger.warning(f"Cycle had errors: {results.get('errors', [])}")
             
             # Wait before next cycle
-            logger.debug(f"Waiting {cycle_interval_seconds} seconds before next cycle...")
-            time.sleep(cycle_interval_seconds)
+            # CRITICAL: Use PRT_RECHECK_INTERVAL_SECONDS parameter (not hardcoded)
+            wait_seconds = PRT_RECHECK_INTERVAL_SECONDS
+            logger.warning(f"⏸️  Waiting {wait_seconds} seconds ({wait_seconds / 60:.1f} minutes) before next PRT cycle...")
+            logger.warning(f"   (Parameter PRT_RECHECK_INTERVAL_SECONDS = {PRT_RECHECK_INTERVAL_SECONDS})")
+            time.sleep(wait_seconds)
             
     except KeyboardInterrupt:
         logger.info("Trading loop interrupted by user")

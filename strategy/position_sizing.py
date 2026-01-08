@@ -59,21 +59,36 @@ class PositionSizer:
                 logger.error("Could not find currentBalances in account info")
                 return None
             
-            # Try various field names for buying power
-            buying_power = (
+            # Prioritize intraday buying power for day trading
+            intraday_buying_power = (
+                current_balances.get('dayTradingBuyingPower') or
+                current_balances.get('intradayBuyingPower') or
+                current_balances.get('dayTradingBuyingPowerCall')
+            )
+            
+            # Fallback to regular buying power
+            regular_buying_power = (
                 current_balances.get('buyingPower') or
                 current_balances.get('buyingPowerNonMarginableTrade') or
-                current_balances.get('dayTradingBuyingPower') or
                 current_balances.get('availableFunds') or
                 current_balances.get('cashBalance')
             )
             
+            # Use intraday if available, otherwise use regular
+            buying_power = intraday_buying_power if intraday_buying_power is not None else regular_buying_power
+            
             if buying_power is not None:
-                logger.info(f"Available buying power: ${buying_power:,.2f}")
+                if intraday_buying_power is not None:
+                    logger.info(f"Intraday buying power: ${intraday_buying_power:,.2f}")
+                    if regular_buying_power is not None and regular_buying_power != intraday_buying_power:
+                        logger.info(f"Regular buying power: ${regular_buying_power:,.2f}")
+                else:
+                    logger.info(f"Available buying power: ${buying_power:,.2f} (intraday not available)")
                 return float(buying_power)
             else:
                 logger.warning("Buying power not found in account info")
                 logger.debug(f"Available balance fields: {list(current_balances.keys())}")
+                logger.debug(f"Full currentBalances structure: {current_balances}")
                 return None
                 
         except Exception as e:
@@ -98,11 +113,39 @@ class PositionSizer:
                 logger.warning(f"Could not get quote for {ticker}")
                 return None
             
-            # Try to get last price, or use bid/ask midpoint
+            # Check nested 'quote' field first (primary structure in Schwab API)
+            quote_field = quote_data.get('quote', {})
+            if isinstance(quote_field, dict):
+                price = (
+                    quote_field.get('lastPrice') or
+                    quote_field.get('regularMarketLastPrice') or
+                    quote_field.get('closePrice') or
+                    quote_field.get('bidPrice') or
+                    quote_field.get('askPrice')
+                )
+                if price is not None:
+                    logger.debug(f"Current price for {ticker} (from quote field): ${price:.2f}")
+                    return float(price)
+            
+            # Check nested 'regular' field
+            regular_field = quote_data.get('regular', {})
+            if isinstance(regular_field, dict):
+                price = regular_field.get('regularMarketLastPrice')
+                if price is not None:
+                    logger.debug(f"Current price for {ticker} (from regular field): ${price:.2f}")
+                    return float(price)
+            
+            # Fallback to top-level fields
             price = (
                 quote_data.get('lastPrice') or
+                quote_data.get('regularMarketLastPrice') or
+                quote_data.get('last') or
+                quote_data.get('closePrice') or
+                quote_data.get('regularMarketPrice') or
                 quote_data.get('bidPrice') or
-                quote_data.get('askPrice')
+                quote_data.get('bid') or
+                quote_data.get('askPrice') or
+                quote_data.get('ask')
             )
             
             if price is not None:

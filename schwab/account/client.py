@@ -220,11 +220,35 @@ class AccountClient:
             response = requests.get(url, headers=self.headers, params=params)
             
             if response.status_code == 200:
-                orders = response.json()
-                # Filter to only open/pending orders
-                open_statuses = ['WORKING', 'PENDING_ACTIVATION', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER']
-                open_orders = [o for o in orders if o.get('status', '').upper() in open_statuses]
-                logger.debug(f"Found {len(open_orders)} open orders from {len(orders)} total")
+                orders_data = response.json()
+                # Handle different response formats
+                if isinstance(orders_data, list):
+                    orders = orders_data
+                elif isinstance(orders_data, dict):
+                    # Sometimes API returns {'orders': [...]}
+                    orders = orders_data.get('orders', [])
+                    if not orders:
+                        orders = orders_data.get('orderList', [])
+                else:
+                    orders = []
+                
+                # Filter to only open/pending orders (exclude FILLED, CANCELED, REJECTED, EXPIRED)
+                open_statuses = ['WORKING', 'PENDING_ACTIVATION', 'QUEUED', 'ACCEPTED', 'AWAITING_PARENT_ORDER', 'PENDING']
+                closed_statuses = ['FILLED', 'CANCELED', 'REJECTED', 'EXPIRED', 'DONE']
+                
+                open_orders = []
+                for o in orders:
+                    status = o.get('status', '').upper()
+                    if status in open_statuses:
+                        open_orders.append(o)
+                    elif status not in closed_statuses:
+                        # If status is unknown, include it to be safe
+                        logger.warning(f"Unknown order status '{status}' for order {o.get('orderId')} - including in cancellation")
+                        open_orders.append(o)
+                
+                logger.info(f"Found {len(open_orders)} open orders from {len(orders)} total orders")
+                if len(open_orders) > 0:
+                    logger.info(f"Open order statuses: {[o.get('status') for o in open_orders]}")
                 return open_orders
             elif response.status_code == 404:
                 logger.debug("No orders found (404)")

@@ -32,7 +32,8 @@ from constants.parameters import (
     GODEL_PASSWORD,
     MARKET_OPEN_DELAY_MINUTES,
     MARKET_CLOSE_BUFFER_MINUTES,
-    MAX_HOLD_TIME_MINUTES
+    MAX_HOLD_TIME_MINUTES,
+    PRT_RECHECK_INTERVAL_SECONDS
 )
 from core.controller import GodelTerminalController
 from schwab.account.client import AccountClient
@@ -44,7 +45,7 @@ from strategy.trade_tracker import TradeTracker
 
 # Supervisor loop constants
 SUPERVISOR_CHECK_INTERVAL_MINUTES = 15  # Check market status every 15 minutes when closed
-MAIN_LOOP_RETRY_DELAY_SECONDS = 60  # Wait before retrying after error
+MAIN_LOOP_RETRY_DELAY_SECONDS = 10  # Wait before retrying after error
 
 
 def check_prerequisites() -> bool:
@@ -184,7 +185,7 @@ def trading_loop(
     logger.info(f"Max hold time: {MAX_HOLD_TIME_MINUTES} minutes")
     logger.info("=" * 60)
     
-    cycle_interval_seconds = 60  # Run strategy cycle every 60 seconds
+    cycle_interval_seconds = PRT_RECHECK_INTERVAL_SECONDS  # Run strategy cycle every 60 seconds
     
     try:
         while True:

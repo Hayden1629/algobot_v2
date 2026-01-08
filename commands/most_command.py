@@ -18,7 +18,7 @@ from core.controller import BaseCommand
 class MOSTCommand(BaseCommand):
     """Most Active Stocks (MOST) command - extracts table data to DataFrame"""
     
-    def __init__(self, controller, tab: str = "ACTIVE", limit: int = 75):
+    def __init__(self, controller, tab: str = "ACTIVE", limit: int = 100):
         """
         Initialize MOST command
         

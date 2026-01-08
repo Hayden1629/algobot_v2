@@ -54,6 +54,10 @@ algobot_v2/
 │   ├── position_sizing.py   # Position sizing calculations
 │   └── trade_executor.py    # Trade execution with limit orders
 │
+├── monitoring/        # System monitoring
+│   ├── __init__.py
+│   └── account_size.py      # Account size monitoring and CSV logging
+│
 ├── scripts/           # Utility scripts
 │   ├── __init__.py
 │   ├── startup.py           # System startup and main trading loop
@@ -83,6 +87,7 @@ algobot_v2/
   - MOST command parameters (tab, limit)
   - Market hours parameters
   - Order parameters (limit order settings, price offsets)
+  - Account monitoring parameters (check interval)
   - Timeouts and browser settings
 
 - `blacklist.py`: Commission blacklist for stocks that have trading commissions
@@ -142,8 +147,9 @@ Application code → Calls TokenManager.get_access_token()
 2. **`orders.py`**: OrderManager class
    - Order creation (market orders, limit orders)
    - Order cancellation
-   - Order status checking
+   - Order status checking (`get_order_status()`)
    - Retry logic with exponential backoff for rate limiting
+   - Handles "Order in state FILLED cannot be canceled" error detection
 
 **Key Methods**:
 - `AccountClient.get_account_info()`: Get account balance, equity, buying power
@@ -151,6 +157,7 @@ Application code → Calls TokenManager.get_access_token()
 - `OrderManager.create_market_order()`: Create market order
 - `OrderManager.create_limit_order()`: Create limit order with price
 - `OrderManager.cancel_order()`: Cancel an order
+- `OrderManager.get_order_status()`: Get order status and fill information
 
 #### Market Data Subpackage (`schwab/market_data/`)
 
@@ -167,6 +174,8 @@ Application code → Calls TokenManager.get_access_token()
 - `is_market_open()`: Check if market is open with delay check
 - `get_quote()`: Get current price for a symbol
 - `get_quote_full()`: Get full quote data including exchange info
+  - Returns nested structure with `quote` field containing `bidPrice`, `askPrice`, `lastPrice`
+  - Also includes `regular` field with `regularMarketLastPrice`
 
 ### Database Package (`database/`)
 
@@ -270,11 +279,25 @@ Controller.execute_command() → Send command → Wait for window → Extract da
    - Sorts by prob_up thresholds
    - Creates positions based on PRT predictions
    - Maintains positions by re-running PRT
-   - Closes positions that no longer meet criteria
-   - Opens new positions that meet criteria
+   - **Position Direction Checking**:
+     - Compares PRT direction (prob_up > 50% = LONG, < 50% = SHORT) with current position direction
+     - If PRT direction matches position direction → Keep position (log it)
+     - If PRT direction is opposite → Close position
+   - **Boxed Position Prevention**:
+     - Checks existing positions before opening new ones
+     - Only opens positions for tickers not already in portfolio
+     - Prevents attempting to open positions that would create boxed positions
+   - **Position Closing**:
+     - Uses limit orders first when closing positions
+     - Falls back to market orders if limit orders don't fill
+     - Checks order fills and retries if needed
    - **Rolling Cycle Logic**:
      - First iteration: MOST tickers only → PRT → Open positions
      - Subsequent iterations: (Active positions from previous) + MOST → PRT → Maintain/close/open
+   - **Key Methods**:
+     - `get_position_details()`: Get position direction (LONG/SHORT) and quantity
+     - `should_close_position()`: Determine if position should be closed based on PRT
+     - `execute_cycle()`: Main strategy execution cycle
 
 2. **`trade_tracker.py`**: TradeTracker class
    - Tracks trade entry times
@@ -284,7 +307,13 @@ Controller.execute_command() → Send command → Wait for window → Extract da
 
 3. **`position_sizing.py`**: PositionSizer class
    - Retrieves buying power from Schwab account
+     - Prioritizes intraday buying power (dayTradingBuyingPower) for day trading
+     - Falls back to regular buying power if intraday not available
+     - Logs both intraday and regular buying power when available
    - Gets current market prices
+     - Checks nested `quote` field first (primary structure in Schwab API)
+     - Falls back to `regular` field, then top-level fields
+     - Handles various price field names (lastPrice, regularMarketLastPrice, bidPrice, askPrice)
    - Calculates position sizes based on:
      - Maximum position size constraint (MAX_POSITION_SIZE_DOLLARS)
      - Available buying power
@@ -293,20 +322,49 @@ Controller.execute_command() → Send command → Wait for window → Extract da
 4. **`trade_executor.py`**: TradeExecutor class
    - Executes trades using limit orders
    - Gets bid/ask prices from market data
+     - Checks nested `quote` field first for bid/ask prices
+     - Falls back to last price if bid/ask not available
+     - Uses last price as primary source (bid/ask may not be available)
    - Uses optimal pricing:
-     - **Longs**: Uses bid price (what we're willing to pay)
-     - **Shorts**: Uses ask price (what we're willing to sell at)
+     - **Longs**: Uses bid price (or last price if bid unavailable)
+     - **Shorts**: Uses ask price (or last price if ask unavailable)
+   - **Order Fill Verification**:
+     - After placing all orders, checks each order's fill status
+     - If not filled, cancels order, gets new price quote, and places new order
+     - Retries up to 3 times with updated prices
+     - Falls back to market orders if limit orders don't fill after retries
+     - Handles "Order in state FILLED cannot be canceled" error (treats as fill)
+     - Only reports "Trade Execution Complete" when all orders are filled
    - Handles order execution with error handling
 
 **Strategy Flow**:
 ```
-Get tickers from MOST → Get open positions → Combine tickers
-→ Run PRT analysis → Filter by prob_up thresholds
+Get tickers from MOST → Get open positions with directions → Combine tickers
+→ Run PRT analysis → Compare PRT direction with position direction
+→ Keep positions where PRT matches position direction
+→ Close positions where PRT direction is opposite (using limit orders, fallback to market)
+→ Filter new candidates (exclude tickers already in positions to avoid boxed positions)
 → Size positions (PositionSizer) → Execute trades (TradeExecutor)
-→ Close positions that don't meet criteria
+→ Verify order fills → Retry unfilled orders with new prices
 → Track trade times → Close expired trades
 → Next iteration: Active positions feed into PRT analysis
 ```
+
+### Monitoring Package (`monitoring/`)
+
+**Purpose**: System monitoring and performance tracking.
+
+**Modules**:
+1. **`account_size.py`**: AccountSizeMonitor class
+   - Periodically checks account size and metrics
+   - Logs to CSV file (`account_size_history.csv`) for easy graphing
+   - Tracks: account_value, buying_power, intraday_buying_power, cash_balance, equity, liquidation_value
+   - Configurable check interval (ACCOUNT_SIZE_CHECK_INTERVAL_MINUTES)
+   - CSV format with timestamp for easy visualization
+
+**Key Methods**:
+- `get_account_metrics()`: Retrieves current account metrics from Schwab API
+- `log_account_size()`: Appends account metrics to CSV file with timestamp
 
 ### Scripts Package (`scripts/`)
 
@@ -315,14 +373,17 @@ Get tickers from MOST → Get open positions → Combine tickers
 **Modules**:
 1. **`startup.py`**: Main system startup and trading loop
    - Checks prerequisites (database, tokens)
+   - Checks token file age (re-acquires if > 29 minutes old)
    - Initializes database if needed
    - Acquires tokens if needed
    - Initializes Schwab API clients (AccountClient, MarketDataClient, OrderManager)
    - Initializes Godel Terminal controller
+   - Initializes AccountSizeMonitor for periodic account tracking
    - Runs supervisor loop (when market closed)
    - Runs trading loop (when market open)
    - Executes rolling strategy cycles continuously
    - Monitors market hours and closes positions before market close
+   - Logs account size periodically during trading
    - Handles cleanup on exit
 
 2. **`algo_loop.py`**: Alternative algorithm loop entry point
@@ -394,12 +455,16 @@ TradeExecutor
     ├── Uses: AccountClient
     ├── Uses: MarketDataClient
     ├── Uses: OrderManager
-    └── Provides: execute_trades(), execute_trade(), get_limit_price()
+    └── Provides: execute_trades(), execute_trade(), get_limit_price(), get_bid_ask_prices()
 
 OrderManager
     ├── Uses: AccountClient
     ├── Uses: MarketDataClient
-    └── Provides: create_market_order(), create_limit_order(), cancel_order()
+    └── Provides: create_market_order(), create_limit_order(), cancel_order(), get_order_status()
+
+AccountSizeMonitor
+    ├── Uses: AccountClient
+    └── Provides: log_account_size(), get_account_metrics()
 ```
 
 ## Dependencies
@@ -457,18 +522,40 @@ Application → database.init.get_connection()
 ```
 RollingStrategy.execute_cycle()
   → Get tickers from MOST
-  → Get active positions
+  → Get active positions with directions (get_position_details())
   → Combine and run PRT
-  → Filter by prob_up thresholds
+  → Compare PRT direction with position direction
+  → Keep positions where directions match
+  → Close positions where directions are opposite
+    → TradeExecutor.get_limit_price() for closing price
+    → OrderManager.create_limit_order() (limit order first)
+    → Check order fills → Fallback to market order if needed
+  → Filter new candidates (exclude existing positions)
   → PositionSizer.size_trades()
-    → Get buying power
-    → Get current prices
+    → Get buying power (prioritize intraday)
+    → Get current prices (check nested quote field)
     → Calculate position sizes
   → TradeExecutor.execute_trades()
-    → Get bid/ask prices
-    → Determine limit prices (bid for longs, ask for shorts)
+    → Get bid/ask prices (from nested quote field, fallback to last price)
+    → Determine limit prices (bid for longs, ask for shorts, or last price)
     → OrderManager.create_limit_order()
     → Place orders via Schwab API
+    → Check order fills (get_order_status())
+    → Retry unfilled orders with new prices
+    → Handle "FILLED cannot be canceled" error (treat as fill)
+    → Fallback to market orders if limit orders don't fill
+```
+
+### Account Monitoring Flow
+```
+Trading loop → AccountSizeMonitor initialized
+  → Every ACCOUNT_SIZE_CHECK_INTERVAL_MINUTES:
+    → AccountSizeMonitor.get_account_metrics()
+      → AccountClient.get_account_info()
+      → Extract account_value, buying_power, etc.
+    → AccountSizeMonitor.log_account_size()
+      → Append to account_size_history.csv
+      → Format: timestamp, account_value, buying_power, intraday_buying_power, cash_balance, equity, liquidation_value
 ```
 
 ## Design Patterns
@@ -478,6 +565,43 @@ RollingStrategy.execute_cycle()
 3. **Factory Pattern**: `GodelTerminalController.register_command()` - registers command types
 4. **Repository Pattern**: `tokens.storage` - abstracts token storage details
 
+## Recent Updates
+
+### Order Fill Verification
+- TradeExecutor now verifies all orders are filled before reporting completion
+- Checks order status after placement
+- Retries unfilled orders with updated prices
+- Handles "Order in state FILLED cannot be canceled" error correctly
+- Falls back to market orders if limit orders don't fill after retries
+
+### Boxed Position Prevention
+- RollingStrategy now checks existing positions before opening new ones
+- Compares PRT direction with current position direction
+- Only opens positions for tickers not already in portfolio
+- Prevents attempting to create boxed positions
+
+### Position Direction Matching
+- Compares PRT prediction direction (prob_up > 50% = LONG, < 50% = SHORT) with current position
+- Keeps positions where PRT direction matches position direction
+- Closes positions where PRT direction is opposite
+- Uses limit orders first when closing, with market order fallback
+
+### Price Data Extraction
+- Updated to check nested `quote` field in Schwab API response
+- Handles various price field names (lastPrice, regularMarketLastPrice, bidPrice, askPrice)
+- Falls back through multiple field locations for robustness
+
+### Account Size Monitoring
+- New monitoring package tracks account size periodically
+- Logs to CSV file for easy graphing
+- Tracks account value, buying power, cash balance, equity, etc.
+- Configurable check interval
+
+### Buying Power Display
+- PositionSizer now prioritizes and displays intraday buying power
+- Shows both intraday and regular buying power when available
+- Better suited for day trading operations
+
 ## Future Enhancements
 
 1. **Database Manager**: Add database manager class for trade operations
@@ -485,9 +609,8 @@ RollingStrategy.execute_cycle()
 3. **Testing**: Unit tests for critical components
 4. **Configuration**: Environment-based configuration management
 5. **Risk Management**: Enhanced risk management features (position limits, daily loss limits)
-6. **Order Status Tracking**: Track order fills and update positions accordingly
-7. **Performance Metrics**: Track strategy performance and statistics
-8. **Backtesting**: Historical backtesting capabilities
+6. **Performance Metrics**: Track strategy performance and statistics
+7. **Backtesting**: Historical backtesting capabilities
 
 ## Maintenance Notes
 

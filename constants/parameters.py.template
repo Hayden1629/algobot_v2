@@ -39,7 +39,7 @@ PROB_UP_EDGE_THRESHOLD = 0.00001  # Minimum edge for consideration
 
 # MOST Command Parameters
 MOST_TAB = "ACTIVE"  # Tab to use: ACTIVE, GAINERS, LOSERS, VALUE
-MOST_LIMIT = 75  # Number of results (10, 25, 50, 75, 100)
+MOST_LIMIT = 100  # Number of results (10, 25, 50, 75, 100)
 PRT_MAX_TICKERS = 75  # Maximum tickers that can be sent to PRT
 
 # Market Hours Parameters

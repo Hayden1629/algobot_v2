@@ -45,7 +45,8 @@ class TradeTracker:
             'ticker': ticker.upper(),
             'trade_id': trade_id,
             'entry_time': entry_time,
-            'age_minutes': 0.0
+            'age_minutes': 0.0,
+            'stop_loss_order_id': None  # Track stop loss order ID
         }
         logger.debug(f"Added trade to tracker: {ticker} at {entry_time}")
     
@@ -110,6 +111,34 @@ class TradeTracker:
             list: List of ticker symbols being tracked
         """
         return list(self.trades.keys())
+    
+    def set_stop_loss_order_id(self, ticker: str, order_id: str) -> None:
+        """
+        Set the stop loss order ID for a trade.
+        
+        Args:
+            ticker: Stock ticker symbol
+            order_id: Stop loss order ID
+        """
+        ticker_upper = ticker.upper()
+        if ticker_upper in self.trades:
+            self.trades[ticker_upper]['stop_loss_order_id'] = order_id
+            logger.debug(f"Set stop loss order ID for {ticker}: {order_id}")
+    
+    def get_stop_loss_order_id(self, ticker: str) -> Optional[str]:
+        """
+        Get the stop loss order ID for a trade.
+        
+        Args:
+            ticker: Stock ticker symbol
+        
+        Returns:
+            str: Stop loss order ID, or None if not found
+        """
+        ticker_upper = ticker.upper()
+        if ticker_upper in self.trades:
+            return self.trades[ticker_upper].get('stop_loss_order_id')
+        return None
     
     def clear(self) -> None:
         """Clear all tracked trades."""

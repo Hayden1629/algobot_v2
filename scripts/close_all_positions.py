@@ -114,7 +114,17 @@ def main():
                 logger.info(f"  Cancelling {order_type} order for {symbol} (ID: {order_id}, Status: {status})")
                 result = order_manager.cancel_order(str(order_id))
                 if 'error' in result:
-                    logger.warning(f"    Could not cancel: {result.get('error')}")
+                    error = result.get('error', '').upper()
+                    if 'FILLED' in error or 'NOT FOUND' in error or '404' in error:
+                        logger.debug(f"    Order {order_id} already filled or doesn't exist")
+                    else:
+                        logger.warning(f"    Could not cancel: {result.get('error')}")
+        
+        # Small delay to ensure cancellations are processed
+        import time
+        if open_orders:
+            logger.info("Waiting 1 second for cancellations to process...")
+            time.sleep(1)
         else:
             logger.info("No open orders found")
         

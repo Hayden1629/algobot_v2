@@ -24,7 +24,10 @@ from constants.parameters import (
     PROB_UP_EDGE_THRESHOLD,
     MOST_TAB,
     MOST_LIMIT,
-    PRT_MAX_TICKERS
+    PRT_MAX_TICKERS,
+    MAX_POSITIONS,
+    STOP_LOSS_PERCENT,
+    DO_OPPOSITE
 )
 from constants.blacklist import filter_blacklisted_tickers
 from strategy.trade_tracker import TradeTracker
@@ -163,7 +166,7 @@ class RollingStrategy:
             
             tickers = []
             for position in positions:
-                symbol = position.get('symbol', '')
+                symbol = position.get('instrument', {}).get('symbol', position.get('symbol', ''))
                 if symbol:
                     tickers.append(symbol.upper())
             
@@ -173,6 +176,47 @@ class RollingStrategy:
         except Exception as e:
             logger.error(f"Error getting open positions: {e}")
             return []
+    
+    def get_position_details(self) -> Dict[str, Dict]:
+        """
+        Get detailed position information including direction.
+        
+        Returns:
+            dict: {ticker: {'direction': 'LONG'|'SHORT', 'quantity': int, 'position': dict}}
+        """
+        try:
+            positions = self.account_client.get_positions()
+            if positions is None:
+                return {}
+            
+            position_details = {}
+            for position in positions:
+                symbol = position.get('instrument', {}).get('symbol', position.get('symbol', ''))
+                if not symbol:
+                    continue
+                
+                symbol = symbol.upper()
+                long_qty = position.get('longQuantity', 0)
+                short_qty = position.get('shortQuantity', 0)
+                
+                if long_qty > 0:
+                    position_details[symbol] = {
+                        'direction': 'LONG',
+                        'quantity': int(long_qty),
+                        'position': position
+                    }
+                elif short_qty > 0:
+                    position_details[symbol] = {
+                        'direction': 'SHORT',
+                        'quantity': int(short_qty),
+                        'position': position
+                    }
+            
+            return position_details
+            
+        except Exception as e:
+            logger.error(f"Error getting position details: {e}")
+            return {}
     
     def run_prt_analysis(self, tickers: List[str]) -> Optional[Dict]:
         """
@@ -286,7 +330,22 @@ class RollingStrategy:
         long_candidates.sort(key=lambda x: x['edge'], reverse=True)
         short_candidates.sort(key=lambda x: abs(x['edge']), reverse=True)
         
-        logger.info(f"Found {len(long_candidates)} long candidates, {len(short_candidates)} short candidates")
+        # If DO_OPPOSITE is enabled, swap long and short candidates
+        if DO_OPPOSITE:
+            logger.info("DO_OPPOSITE enabled: Inverting trading directions")
+            # Swap the lists and invert the direction in each candidate
+            for candidate in long_candidates:
+                candidate['original_direction'] = 'LONG'
+            for candidate in short_candidates:
+                candidate['original_direction'] = 'SHORT'
+            
+            # Swap the lists
+            long_candidates, short_candidates = short_candidates, long_candidates
+            
+            logger.info(f"After inversion: {len(long_candidates)} long candidates (originally short), {len(short_candidates)} short candidates (originally long)")
+        else:
+            logger.info(f"Found {len(long_candidates)} long candidates, {len(short_candidates)} short candidates")
+        
         return long_candidates, short_candidates
     
     def should_close_position(self, ticker: str, current_prt_data: Dict) -> bool:
@@ -410,110 +469,281 @@ class RollingStrategy:
                 results['errors'].append("Failed to get PRT data")
                 return results
             
-            # Step 5: Filter by prob_up thresholds to find new trade candidates
+            # Step 5: Get current position details (direction and quantity)
+            position_details = self.get_position_details()
+            
+            # Step 6: Filter by prob_up thresholds to find trade candidates
             long_candidates, short_candidates = self.filter_trades_by_prob_up(prt_data)
             
-            # Step 6: Check which active positions should be closed (based on PRT)
-            # These positions will NOT feed into the next iteration
+            # Step 7: Check each active position against PRT data
+            # - If PRT direction matches position direction: keep position (log it)
+            # - If PRT direction is opposite: close position
             positions_to_close = []
+            positions_to_keep = []
+            
             for ticker in active_positions:
-                if ticker in prt_data and self.should_close_position(ticker, prt_data):
-                    positions_to_close.append(ticker)
+                if ticker not in prt_data:
+                    # No PRT data - keep position for now
+                    positions_to_keep.append(ticker)
+                    continue
+                
+                pos_info = position_details.get(ticker, {})
+                pos_direction = pos_info.get('direction', '')
+                prt_data_ticker = prt_data[ticker]
+                prob_up = prt_data_ticker.get('prob_up')
+                
+                if prob_up is None:
+                    positions_to_keep.append(ticker)
+                    continue
+                
+                # Determine PRT direction (above 50% = long, below 50% = short)
+                prt_direction = 'LONG' if prob_up > 0.5 else 'SHORT'
+                
+                # If DO_OPPOSITE is enabled, invert the decision logic
+                if DO_OPPOSITE:
+                    # Inverted logic: if directions match, close (opposite of normal)
+                    if pos_direction == prt_direction:
+                        # Direction matches - close position (inverted)
+                        positions_to_close.append(ticker)
+                        logger.info(f"Closing {pos_direction} {ticker}: DO_OPPOSITE enabled, PRT direction matches (prob_up={prob_up:.3f})")
+                    else:
+                        # Direction opposite - keep position (inverted)
+                        positions_to_keep.append(ticker)
+                        logger.debug(f"Keeping {pos_direction} {ticker}: DO_OPPOSITE enabled, PRT direction is {prt_direction} (prob_up={prob_up:.3f})")
+                else:
+                    # Normal logic: if directions match, keep
+                    if pos_direction == prt_direction:
+                        # Direction matches - keep position
+                        positions_to_keep.append(ticker)
+                        logger.debug(f"Keeping {pos_direction} {ticker}: PRT direction matches (prob_up={prob_up:.3f})")
+                    else:
+                        # Direction opposite - close position
+                        positions_to_close.append(ticker)
+                        logger.info(f"Closing {pos_direction} {ticker}: PRT direction is {prt_direction} (prob_up={prob_up:.3f})")
             
             results['trades_closed'] = len(positions_to_close)
             
-            # Step 7: Determine new positions to open (not already in active positions)
-            # These new positions will feed into the next iteration's PRT analysis
-            new_long_candidates = [c for c in long_candidates if c['ticker'] not in active_positions]
-            new_short_candidates = [c for c in short_candidates if c['ticker'] not in active_positions]
+            # Step 8: Determine new positions to open (not already in active positions)
+            # Filter out any tickers we already have positions in to avoid boxed positions
+            new_long_candidates = [
+                c for c in long_candidates 
+                if c['ticker'] not in active_positions
+            ]
+            new_short_candidates = [
+                c for c in short_candidates 
+                if c['ticker'] not in active_positions
+            ]
             
             results['trades_opened'] = len(new_long_candidates) + len(new_short_candidates)
             
             # Step 8: Log summary
-            logger.info(f"Active positions (will feed into next iteration): {len(active_positions)}")
-            logger.info(f"Positions to close: {len(positions_to_close)} {positions_to_close[:5] if positions_to_close else ''}")
+            logger.info(f"Active positions: {len(active_positions)}")
+            logger.info(f"Positions to keep (PRT direction matches): {len(positions_to_keep)} {positions_to_keep[:5] if positions_to_keep else ''}")
+            logger.info(f"Positions to close (PRT direction opposite): {len(positions_to_close)} {positions_to_close[:5] if positions_to_close else ''}")
             logger.info(f"New long candidates: {len(new_long_candidates)} {[c['ticker'] for c in new_long_candidates[:5]]}")
             logger.info(f"New short candidates: {len(new_short_candidates)} {[c['ticker'] for c in new_short_candidates[:5]]}")
             
-            # Step 9: Close positions that no longer meet criteria
-            if positions_to_close and self.order_manager:
+            # Step 9: Close positions that no longer meet criteria (use limit orders first)
+            if positions_to_close and self.order_manager and self.trade_executor:
                 logger.info(f"Closing {len(positions_to_close)} position(s) that no longer meet criteria...")
+                close_orders = []
+                
                 for ticker in positions_to_close:
                     try:
-                        # Get position details to determine direction and quantity
-                        positions = self.account_client.get_positions()
-                        for pos in positions:
-                            if pos.get('instrument', {}).get('symbol', '').upper() == ticker.upper():
-                                long_qty = pos.get('longQuantity', 0)
-                                short_qty = pos.get('shortQuantity', 0)
-                                
-                                if long_qty > 0:
-                                    result = self.order_manager.create_market_order(ticker, "SELL", int(long_qty))
-                                    if 'orderId' in result or 'success' in result:
-                                        logger.info(f"✓ Closed long position: {ticker} {int(long_qty)} shares")
-                                        self.trade_tracker.remove_trade(ticker)
+                        pos_info = position_details.get(ticker, {})
+                        direction = pos_info.get('direction', '')
+                        quantity = pos_info.get('quantity', 0)
+                        
+                        if not direction or quantity <= 0:
+                            logger.warning(f"Invalid position info for {ticker}, skipping close")
+                            continue
+                        
+                        # Cancel stop loss order first if it exists
+                        stop_loss_order_id = self.trade_tracker.get_stop_loss_order_id(ticker)
+                        if stop_loss_order_id:
+                            logger.info(f"Canceling stop loss order for {ticker} (Order ID: {stop_loss_order_id})")
+                            cancel_result = self.order_manager.cancel_order(stop_loss_order_id)
+                            if cancel_result.get('success'):
+                                logger.info(f"✓ Stop loss order canceled for {ticker}")
+                            else:
+                                # Check if order was already filled or doesn't exist
+                                if cancel_result.get('error'):
+                                    error_msg = cancel_result.get('error', '').upper()
+                                    if 'FILLED' in error_msg or 'NOT FOUND' in error_msg or '404' in error_msg:
+                                        logger.debug(f"Stop loss order for {ticker} already filled or doesn't exist")
                                     else:
-                                        logger.error(f"✗ Failed to close long {ticker}: {result}")
-                                
-                                if short_qty > 0:
-                                    result = self.order_manager.create_market_order(ticker, "BUY_TO_COVER", int(short_qty))
-                                    if 'orderId' in result or 'success' in result:
-                                        logger.info(f"✓ Closed short position: {ticker} {int(short_qty)} shares")
-                                        self.trade_tracker.remove_trade(ticker)
-                                    else:
-                                        logger.error(f"✗ Failed to close short {ticker}: {result}")
-                                
-                                break
+                                        logger.warning(f"Failed to cancel stop loss order for {ticker}: {cancel_result.get('error')}")
+                        
+                        # Get limit price for closing
+                        if direction == 'LONG':
+                            limit_price = self.trade_executor.get_limit_price(ticker, 'LONG')
+                            instruction = 'SELL'
+                        else:  # SHORT
+                            limit_price = self.trade_executor.get_limit_price(ticker, 'SHORT')
+                            instruction = 'BUY_TO_COVER'
+                        
+                        if limit_price is None:
+                            logger.warning(f"Could not get limit price for {ticker}, using market order")
+                            result = self.order_manager.create_market_order(ticker, instruction, quantity)
+                        else:
+                            logger.info(f"Closing {direction} {ticker}: {quantity} shares @ ${limit_price:.2f} limit")
+                            result = self.order_manager.create_limit_order(ticker, instruction, quantity, limit_price)
+                        
+                        if 'orderId' in result or 'success' in result:
+                            order_id = result.get('orderId', result.get('order_id', 'unknown'))
+                            close_orders.append({
+                                'ticker': ticker,
+                                'direction': direction,
+                                'quantity': quantity,
+                                'order_id': order_id,
+                                'instruction': instruction,
+                                'limit_price': limit_price
+                            })
+                            logger.info(f"✓ Placed close order for {direction} {ticker}: {quantity} shares (Order ID: {order_id})")
+                        else:
+                            logger.error(f"✗ Failed to place close order for {ticker}: {result}")
+                            
                     except Exception as e:
                         logger.error(f"Error closing position {ticker}: {e}")
+                
+                # Check if limit orders filled, fall back to market if needed
+                if close_orders:
+                    import time
+                    time.sleep(2)  # Wait a moment for orders to process
+                    
+                    for close_order in close_orders:
+                        order_id = close_order['order_id']
+                        ticker = close_order['ticker']
+                        
+                        # Check order status
+                        order_status = self.order_manager.get_order_status(order_id)
+                        status = order_status.get('status', '').upper()
+                        
+                        if status == 'FILLED':
+                            logger.info(f"✓ Close order filled for {ticker}")
+                            self.trade_tracker.remove_trade(ticker)
+                        elif status in ['REJECTED', 'CANCELED', 'EXPIRED']:
+                            logger.warning(f"Close order {status} for {ticker}, using market order")
+                            # Fall back to market order
+                            result = self.order_manager.create_market_order(
+                                ticker, 
+                                close_order['instruction'], 
+                                close_order['quantity']
+                            )
+                            if 'orderId' in result or 'success' in result:
+                                logger.info(f"✓ Market order placed to close {ticker}")
+                                self.trade_tracker.remove_trade(ticker)
+                        elif status in ['WORKING', 'PENDING_ACTIVATION', 'QUEUED', 'ACCEPTED']:
+                            # Still working, wait a bit more then check again
+                            time.sleep(3)
+                            order_status = self.order_manager.get_order_status(order_id)
+                            status = order_status.get('status', '').upper()
+                            
+                            if status == 'FILLED':
+                                logger.info(f"✓ Close order filled for {ticker} (after wait)")
+                                self.trade_tracker.remove_trade(ticker)
+                            else:
+                                # Cancel and use market order
+                                logger.warning(f"Close order still {status} for {ticker}, canceling and using market order")
+                                self.order_manager.cancel_order(order_id)
+                                result = self.order_manager.create_market_order(
+                                    ticker, 
+                                    close_order['instruction'], 
+                                    close_order['quantity']
+                                )
+                                if 'orderId' in result or 'success' in result:
+                                    logger.info(f"✓ Market order placed to close {ticker}")
+                                    self.trade_tracker.remove_trade(ticker)
             
             # Step 10: Size and execute new trades
             if (new_long_candidates or new_short_candidates) and self.position_sizer and self.trade_executor:
-                # Prepare trade candidates for sizing
-                trade_candidates = []
-                for candidate in new_long_candidates:
-                    trade_candidates.append({
-                        'ticker': candidate['ticker'],
-                        'direction': 'LONG',
-                        'prob_up': candidate.get('prob_up'),
-                        'edge': candidate.get('edge')
-                    })
-                for candidate in new_short_candidates:
-                    trade_candidates.append({
-                        'ticker': candidate['ticker'],
-                        'direction': 'SHORT',
-                        'prob_up': candidate.get('prob_up'),
-                        'edge': candidate.get('edge')
-                    })
+                # Check actual current position count from account (more accurate than positions_to_keep)
+                # This accounts for positions that may have been closed in previous cycles
+                actual_positions = self.get_open_positions_tickers()
+                current_position_count = len(actual_positions)
+                available_slots = MAX_POSITIONS - current_position_count
                 
-                if trade_candidates:
-                    logger.info(f"Sizing {len(trade_candidates)} trade candidate(s)...")
-                    # Size the trades
-                    sized_trades = self.position_sizer.size_trades(trade_candidates)
+                if available_slots <= 0:
+                    logger.warning(f"Maximum positions ({MAX_POSITIONS}) reached. Current: {current_position_count}. Skipping new position opens.")
+                else:
+                    logger.info(f"Position limit: {current_position_count}/{MAX_POSITIONS} positions. Can open up to {available_slots} new position(s).")
                     
-                    if sized_trades:
-                        logger.info(f"Executing {len(sized_trades)} trade(s)...")
-                        # Execute the trades
-                        execution_results = self.trade_executor.execute_trades(sized_trades)
+                    # Prepare trade candidates for sizing
+                    trade_candidates = []
+                    for candidate in new_long_candidates:
+                        trade_candidates.append({
+                            'ticker': candidate['ticker'],
+                            'direction': 'LONG',
+                            'prob_up': candidate.get('prob_up'),
+                            'edge': candidate.get('edge')
+                        })
+                    for candidate in new_short_candidates:
+                        trade_candidates.append({
+                            'ticker': candidate['ticker'],
+                            'direction': 'SHORT',
+                            'prob_up': candidate.get('prob_up'),
+                            'edge': candidate.get('edge')
+                        })
+                    
+                    # Limit trade candidates to available position slots
+                    if len(trade_candidates) > available_slots:
+                        # Sort by edge (absolute value) to prioritize best candidates
+                        trade_candidates.sort(key=lambda x: abs(x.get('edge', 0)), reverse=True)
+                        original_count = len(trade_candidates)
+                        trade_candidates = trade_candidates[:available_slots]
+                        logger.info(f"Limiting new positions from {original_count} to {available_slots} (max positions: {MAX_POSITIONS})")
+                    
+                    if trade_candidates:
+                        logger.info(f"Sizing {len(trade_candidates)} trade candidate(s)...")
+                        # Size the trades
+                        sized_trades = self.position_sizer.size_trades(trade_candidates)
                         
-                        # Track successful trades
-                        successful_trades = 0
-                        for result in execution_results:
-                            if result.get('success'):
-                                successful_trades += 1
-                                ticker = result.get('ticker', '').upper()
-                                direction = result.get('direction', '').upper()
-                                shares = result.get('shares', 0)
-                                
-                                # Track the trade
-                                if ticker:
-                                    self.trade_tracker.add_trade(ticker)
-                                    logger.debug(f"Tracking new trade: {ticker} ({direction}, {shares} shares)")
-                        
-                        logger.info(f"Successfully executed {successful_trades}/{len(sized_trades)} trade(s)")
-                        results['trades_opened'] = successful_trades
-                    else:
-                        logger.warning("No trades could be sized (insufficient buying power or invalid prices)")
+                        if sized_trades:
+                            logger.info(f"Executing {len(sized_trades)} trade(s)...")
+                            # Execute the trades
+                            execution_results = self.trade_executor.execute_trades(sized_trades)
+                            
+                            # Track successful trades and place stop loss orders
+                            successful_trades = 0
+                            for result in execution_results:
+                                if result.get('success') and result.get('filled'):
+                                    successful_trades += 1
+                                    ticker = result.get('ticker', '').upper()
+                                    direction = result.get('direction', '').upper()
+                                    shares = result.get('shares', 0)
+                                    entry_price = result.get('price', 0)
+                                    
+                                    # Track the trade
+                                    if ticker:
+                                        self.trade_tracker.add_trade(ticker)
+                                        logger.debug(f"Tracking new trade: {ticker} ({direction}, {shares} shares)")
+                                    
+                                    # Place stop loss order
+                                    if entry_price > 0:
+                                        if direction == 'LONG':
+                                            stop_instruction = 'SELL'
+                                        else:  # SHORT
+                                            stop_instruction = 'BUY_TO_COVER'
+                                        
+                                        stop_loss_result = self.order_manager.create_stop_loss_order(
+                                            ticker,
+                                            stop_instruction,
+                                            shares,
+                                            entry_price,
+                                            STOP_LOSS_PERCENT
+                                        )
+                                        
+                                        if stop_loss_result.get('orderId') or stop_loss_result.get('success'):
+                                            stop_loss_order_id = stop_loss_result.get('orderId', stop_loss_result.get('order_id', 'unknown'))
+                                            self.trade_tracker.set_stop_loss_order_id(ticker, stop_loss_order_id)
+                                            logger.info(f"✓ Stop loss order placed for {ticker} (Order ID: {stop_loss_order_id}, {STOP_LOSS_PERCENT}% loss)")
+                                        else:
+                                            logger.warning(f"Failed to place stop loss order for {ticker}: {stop_loss_result.get('error', 'Unknown error')}")
+                            
+                            logger.info(f"Successfully executed {successful_trades}/{len(sized_trades)} trade(s)")
+                            results['trades_opened'] = successful_trades
+                        else:
+                            logger.warning("No trades could be sized (insufficient buying power or invalid prices)")
             elif not self.order_manager:
                 logger.warning("OrderManager not available - skipping trade execution")
             
