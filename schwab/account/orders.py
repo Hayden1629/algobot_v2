@@ -134,9 +134,15 @@ class OrderManager:
                 logger.info(f"Order {order_id} cancelled successfully")
                 return {'success': True}
             else:
+                # Check if order is already canceled - this is fine, treat as success
+                response_text = response.text if response.text else ""
+                if "CANCELED cannot be canceled" in response_text or "already canceled" in response_text.lower():
+                    logger.debug(f"Order {order_id} was already canceled (status: CANCELED)")
+                    return {'success': True, 'already_canceled': True}
+                
                 error_msg = f"Failed to cancel order {order_id}: {response.status_code}"
-                if response.text:
-                    error_msg += f" - {response.text}"
+                if response_text:
+                    error_msg += f" - {response_text}"
                 logger.error(error_msg)
                 return {'error': error_msg, 'status_code': response.status_code}
                 
@@ -203,7 +209,8 @@ class OrderManager:
             }]
         }
         
-        logger.info(f"Creating limit order: {ticker} {instruction} {quantity} shares @ ${price:.4f}")
+        if SHOW_ORDER_OUTPUT:
+            logger.info(f"Creating limit order: {ticker} {instruction} {quantity} shares @ ${price:.4f}")
         return self.create_order(order_payload)
     
     def get_order_status(self, order_id: str) -> Dict:
@@ -255,7 +262,7 @@ class OrderManager:
         Returns:
             dict: API response with order details
         """
-        # Calculate stop loss price
+        # Calculate stop loss price based on entry price
         if instruction.upper() in ['SELL', 'SELL_SHORT']:
             # For LONG positions: stop loss is below entry price
             stop_price = entry_price * (1 - stop_loss_percent / 100)
@@ -265,6 +272,36 @@ class OrderManager:
         else:
             logger.error(f"Invalid instruction for stop loss: {instruction}")
             return {'error': f'Invalid instruction: {instruction}'}
+        
+        # Get current bid/ask to validate stop price meets Schwab requirements
+        # Schwab requires:
+        # - SELL stop orders: stop price must be BELOW current bid
+        # - BUY stop orders: stop price must be ABOVE current ask
+        quote_data = self.market_data_client.get_quote_full(ticker)
+        if quote_data:
+            quote_field = quote_data.get('quote', {})
+            if isinstance(quote_field, dict):
+                bid_price = quote_field.get('bidPrice')
+                ask_price = quote_field.get('askPrice')
+                
+                if bid_price is not None and ask_price is not None:
+                    bid_price = float(bid_price)
+                    ask_price = float(ask_price)
+                    
+                    if instruction.upper() in ['SELL', 'SELL_SHORT']:
+                        # SELL stop: must be below bid
+                        if stop_price >= bid_price:
+                            # Adjust stop to be below bid (use bid - $0.01 minimum)
+                            stop_price = bid_price - 0.01
+                            if SHOW_ORDER_OUTPUT:
+                                logger.warning(f"Adjusted stop price for {ticker} SELL stop: ${stop_price:.2f} (was above bid ${bid_price:.2f})")
+                    elif instruction.upper() in ['BUY_TO_COVER', 'BUY']:
+                        # BUY stop: must be above ask
+                        if stop_price <= ask_price:
+                            # Adjust stop to be above ask (use ask + $0.01 minimum)
+                            stop_price = ask_price + 0.01
+                            if SHOW_ORDER_OUTPUT:
+                                logger.warning(f"Adjusted stop price for {ticker} BUY stop: ${stop_price:.2f} (was below ask ${ask_price:.2f})")
         
         # Round to appropriate decimal places (Schwab API requirement)
         if stop_price >= 1.0:

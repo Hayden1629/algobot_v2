@@ -30,7 +30,11 @@ DATABASE_PATH = None  # Will be set to project root / database_name
 STOP_LOSS_PERCENT = 2.0  # Default stop loss percentage
 TAKE_PROFIT_PERCENT = 4.0  # Default take profit percentage
 MAX_HOLD_TIME_MINUTES = 60  # Maximum time to hold a position
-MAX_POSITION_SIZE_DOLLARS = 1000.0  # Maximum position size in dollars per trade
+MAX_POSITION_SIZE_DOLLARS = 1000.0  # Maximum position size in dollars per trade (deprecated - using buying power percent instead)
+MAX_POSITIONS = 100  # Maximum number of positions to hold simultaneously
+BUYING_POWER_USAGE_PERCENT = 0.30  # Percentage of intraday buying power to use for positions (30%)
+MAX_NET_EXPOSURE_PERCENT = 0.20  # Maximum net exposure (long - short) as % of account value (20% = balanced, 0% = market neutral)
+DO_OPPOSITE = False  # If True, invert all trading decisions (LONG->SHORT, SHORT->LONG)
 
 # PRT Strategy Parameters (prob_up thresholds)
 PROB_UP_MIN_LONG = 0.55  # Minimum prob_up for long positions
@@ -45,6 +49,10 @@ PRT_MAX_TICKERS = 75  # Maximum tickers that can be sent to PRT
 # Market Hours Parameters
 MARKET_OPEN_DELAY_MINUTES = 1  # Wait after market open before trading
 MARKET_CLOSE_BUFFER_MINUTES = 5  # Stop trading this many minutes before close
+
+# Account Monitoring Parameters
+ACCOUNT_SIZE_CHECK_INTERVAL_MINUTES = 1  # Check and log account size every N minutes
+MAX_DRAWDOWN_PERCENT = 1.0  # Maximum drawdown percentage before emergency shutdown (1.0% = 1%)
 
 # Order Parameters
 USE_LIMIT_ORDERS = True  # Use limit orders instead of market orders

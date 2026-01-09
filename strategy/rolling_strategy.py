@@ -34,6 +34,7 @@ from constants.blacklist import filter_blacklisted_tickers
 from strategy.trade_tracker import TradeTracker
 from strategy.position_sizing import PositionSizer
 from strategy.trade_executor import TradeExecutor
+from database.db_manager import DatabaseManager
 
 
 class RollingStrategy:
@@ -71,9 +72,67 @@ class RollingStrategy:
             self.trade_executor = None
             logger.warning("OrderManager not provided - position sizing and trade execution disabled")
         
+        # Initialize database manager for trade tracking
+        try:
+            self.db_manager = DatabaseManager()
+            if self.db_manager.is_available():
+                logger.debug("Database manager initialized - trades will be sent to dashboard")
+            else:
+                logger.debug("Database not available - trades will only be logged locally")
+                self.db_manager = None
+        except Exception as e:
+            logger.warning(f"Could not initialize database manager: {e} - trades will only be logged locally")
+            self.db_manager = None
+        
         # Register commands
         self.controller.register_command("MOST", MOSTCommand)
         self.controller.register_command("PRT", PRTCommand)
+    
+    def _close_trade_with_db_update(self, ticker: str, order_id: Optional[str] = None) -> None:
+        """
+        Close a trade and update it in the database.
+        
+        Args:
+            ticker: Stock ticker symbol
+            order_id: Optional order ID to get fill price from
+        """
+        exit_price = None
+        
+        # Try to get exit price from order status if order_id provided
+        if order_id:
+            try:
+                order_status = self.order_manager.get_order_status(order_id)
+                if 'averageFillPrice' in order_status:
+                    exit_price = float(order_status['averageFillPrice'])
+                elif 'price' in order_status:
+                    exit_price = float(order_status['price'])
+            except:
+                pass
+        
+        # Fallback: get current quote
+        if exit_price is None:
+            try:
+                quote = self.market_data_client.get_quote(ticker)
+                if quote:
+                    exit_price = quote.get('lastPrice') or quote.get('last')
+            except:
+                pass
+        
+        # Update trade in database
+        if self.db_manager and self.db_manager.is_available() and exit_price:
+            try:
+                from datetime import datetime
+                import pytz
+                self.db_manager.update_trade_on_close(
+                    ticker,
+                    exit_price,
+                    datetime.now(pytz.UTC)
+                )
+            except Exception as e:
+                logger.debug(f"Could not update trade in database for {ticker}: {e}")
+        
+        # Remove from tracker
+        self.trade_tracker.remove_trade(ticker)
     
     def get_tickers_from_most(self) -> List[str]:
         """
@@ -622,7 +681,7 @@ class RollingStrategy:
                         
                         if status == 'FILLED':
                             logger.info(f"✓ Close order filled for {ticker}")
-                            self.trade_tracker.remove_trade(ticker)
+                            self._close_trade_with_db_update(ticker, order_id)
                         elif status in ['REJECTED', 'CANCELED', 'EXPIRED']:
                             logger.warning(f"Close order {status} for {ticker}, using market order")
                             # Fall back to market order
@@ -633,7 +692,11 @@ class RollingStrategy:
                             )
                             if 'orderId' in result or 'success' in result:
                                 logger.info(f"✓ Market order placed to close {ticker}")
-                                self.trade_tracker.remove_trade(ticker)
+                                close_order_id = result.get('orderId', result.get('order_id'))
+                                # Wait a moment for market order to fill, then update
+                                import time
+                                time.sleep(1)
+                                self._close_trade_with_db_update(ticker, close_order_id)
                         elif status in ['WORKING', 'PENDING_ACTIVATION', 'QUEUED', 'ACCEPTED']:
                             # Still working, wait a bit more then check again
                             time.sleep(3)
@@ -642,7 +705,7 @@ class RollingStrategy:
                             
                             if status == 'FILLED':
                                 logger.info(f"✓ Close order filled for {ticker} (after wait)")
-                                self.trade_tracker.remove_trade(ticker)
+                                self._close_trade_with_db_update(ticker, order_id)
                             else:
                                 # Cancel and use market order
                                 logger.warning(f"Close order still {status} for {ticker}, canceling and using market order")
@@ -654,7 +717,10 @@ class RollingStrategy:
                                 )
                                 if 'orderId' in result or 'success' in result:
                                     logger.info(f"✓ Market order placed to close {ticker}")
-                                    self.trade_tracker.remove_trade(ticker)
+                                    close_order_id = result.get('orderId', result.get('order_id'))
+                                    # Wait a moment for market order to fill, then update
+                                    time.sleep(1)
+                                    self._close_trade_with_db_update(ticker, close_order_id)
             
             # Step 10: Size and execute new trades
             if (new_long_candidates or new_short_candidates) and self.position_sizer and self.trade_executor:
@@ -696,8 +762,8 @@ class RollingStrategy:
                     
                     if trade_candidates:
                         logger.info(f"Sizing {len(trade_candidates)} trade candidate(s)...")
-                        # Size the trades
-                        sized_trades = self.position_sizer.size_trades(trade_candidates)
+                        # Size the trades (pass current position count for equal allocation)
+                        sized_trades = self.position_sizer.size_trades(trade_candidates, current_position_count=current_position_count)
                         
                         if sized_trades:
                             logger.info(f"Executing {len(sized_trades)} trade(s)...")
@@ -713,12 +779,34 @@ class RollingStrategy:
                                     direction = result.get('direction', '').upper()
                                     shares = result.get('shares', 0)
                                     entry_price = result.get('price', 0)
+                                    order_id = result.get('order_id', 'unknown')
                                     
                                     # Track the trade
                                     if ticker:
                                         self.trade_tracker.add_trade(ticker)
                                         if SHOW_ORDER_OUTPUT:
                                             logger.debug(f"Tracking new trade: {ticker} ({direction}, {shares} shares)")
+                                        
+                                        # Insert trade to database
+                                        if self.db_manager and self.db_manager.is_available() and entry_price > 0:
+                                            from datetime import datetime
+                                            import pytz
+                                            trade_data = {
+                                                'ticker': ticker,
+                                                'action': direction,
+                                                'quantity': shares,
+                                                'entry_price': entry_price,
+                                                'exit_price': None,
+                                                'profit_loss': None,
+                                                'profit_loss_percent': None,
+                                                'time_placed': datetime.now(pytz.UTC),
+                                                'close_time': None,
+                                                'order_id': str(order_id),
+                                                'is_closed': False
+                                            }
+                                            trade_db_id = self.db_manager.insert_trade(trade_data)
+                                            if trade_db_id:
+                                                logger.debug(f"Trade inserted to database: {ticker} (DB ID: {trade_db_id})")
                                     
                                     # Place stop loss order
                                     if entry_price > 0:

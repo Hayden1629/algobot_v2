@@ -1,0 +1,25 @@
+"""
+Railway MySQL configuration template for algobot_v2.
+Copy this to railway_config.py and fill in your actual Railway credentials.
+"""
+import os
+
+# Railway MySQL credentials for PUBLIC access (from your local machine)
+# Get these from Railway dashboard -> MySQL service -> Connect -> Public Networking
+
+# Only set if not already set (allows override via environment)
+if not os.getenv('MYSQLHOST') and not os.getenv('MYSQL_HOST'):
+    os.environ['MYSQLHOST'] = "your-railway-tcp-proxy-domain.rlwy.net"  # Public TCP Proxy domain
+
+if not os.getenv('MYSQLPORT') and not os.getenv('MYSQL_PORT'):
+    os.environ['MYSQLPORT'] = "your-tcp-proxy-port"  # Public TCP Proxy port (usually 5 digits)
+
+if not os.getenv('MYSQLUSER') and not os.getenv('MYSQL_USER'):
+    os.environ['MYSQLUSER'] = "root"
+
+if not os.getenv('MYSQLPASSWORD') and not os.getenv('MYSQL_PASSWORD') and not os.getenv('MYSQL_ROOT_PASSWORD'):
+    os.environ['MYSQLPASSWORD'] = "your-railway-mysql-password"  # Your Railway MySQL root password
+
+if not os.getenv('MYSQLDATABASE') and not os.getenv('MYSQL_DATABASE'):
+    os.environ['MYSQLDATABASE'] = "railway"
+

@@ -56,7 +56,8 @@ class TradeExecutor:
                 last_price = quote_field.get('lastPrice') or quote_field.get('regularMarketLastPrice')
                 
                 if bid_price is not None and ask_price is not None:
-                    logger.debug(f"Using bid/ask from quote field for {ticker}: bid=${bid_price:.2f}, ask=${ask_price:.2f}")
+                    if SHOW_ORDER_OUTPUT:
+                        logger.debug(f"Using bid/ask from quote field for {ticker}: bid=${bid_price:.2f}, ask=${ask_price:.2f}")
                     return {
                         'bid': float(bid_price),
                         'ask': float(ask_price)
@@ -64,7 +65,8 @@ class TradeExecutor:
                 
                 # Use last price from quote field if bid/ask not available
                 if last_price is not None:
-                    logger.debug(f"Using last price from quote field for {ticker}: ${last_price:.2f}")
+                    if SHOW_ORDER_OUTPUT:
+                        logger.debug(f"Using last price from quote field for {ticker}: ${last_price:.2f}")
                     return {
                         'bid': float(last_price),
                         'ask': float(last_price)
@@ -75,7 +77,8 @@ class TradeExecutor:
             if isinstance(regular_field, dict):
                 last_price = regular_field.get('regularMarketLastPrice')
                 if last_price is not None:
-                    logger.debug(f"Using last price from regular field for {ticker}: ${last_price:.2f}")
+                    if SHOW_ORDER_OUTPUT:
+                        logger.debug(f"Using last price from regular field for {ticker}: ${last_price:.2f}")
                     return {
                         'bid': float(last_price),
                         'ask': float(last_price)
@@ -91,7 +94,8 @@ class TradeExecutor:
             )
             
             if last_price is not None:
-                logger.debug(f"Using last price (top-level) for {ticker}: ${last_price:.2f}")
+                if SHOW_ORDER_OUTPUT:
+                    logger.debug(f"Using last price (top-level) for {ticker}: ${last_price:.2f}")
                 return {
                     'bid': float(last_price),
                     'ask': float(last_price)
@@ -108,7 +112,8 @@ class TradeExecutor:
             )
             
             if bid_price is not None and ask_price is not None:
-                logger.debug(f"Using bid/ask (top-level) for {ticker}: bid=${bid_price:.2f}, ask=${ask_price:.2f}")
+                if SHOW_ORDER_OUTPUT:
+                    logger.debug(f"Using bid/ask (top-level) for {ticker}: bid=${bid_price:.2f}, ask=${ask_price:.2f}")
                 return {
                     'bid': float(bid_price),
                     'ask': float(ask_price)
@@ -142,11 +147,13 @@ class TradeExecutor:
         if direction_upper == 'LONG':
             # For longs, use bid price (or last price if bid unavailable)
             limit_price = prices['bid']
-            logger.debug(f"Long {ticker}: Using limit price ${limit_price:.2f}")
+            if SHOW_ORDER_OUTPUT:
+                logger.debug(f"Long {ticker}: Using limit price ${limit_price:.2f}")
         elif direction_upper == 'SHORT':
             # For shorts, use ask price (or last price if ask unavailable)
             limit_price = prices['ask']
-            logger.debug(f"Short {ticker}: Using limit price ${limit_price:.2f}")
+            if SHOW_ORDER_OUTPUT:
+                logger.debug(f"Short {ticker}: Using limit price ${limit_price:.2f}")
         else:
             logger.error(f"Invalid direction: {direction}")
             return None

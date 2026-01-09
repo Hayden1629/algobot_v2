@@ -1,9 +1,6 @@
 """
-Database package for algobot_v2.
-
-This package handles:
-- Database initialization and schema creation
-- Database connection management
-- Trade and PRT data storage operations
+Database module for algobot_v2.
 """
+from .db_manager import DatabaseManager
 
+__all__ = ['DatabaseManager']

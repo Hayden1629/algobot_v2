@@ -16,6 +16,20 @@ import os
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# Load Railway MySQL credentials automatically (if config exists)
+# This must happen before any database imports
+try:
+    import railway_config
+    # Use print here since logger isn't configured yet
+    print("✓ Railway MySQL credentials loaded from railway_config.py")
+except ImportError:
+    # Check if environment variables are already set
+    if not (os.getenv('MYSQLHOST') or os.getenv('MYSQL_HOST')):
+        print("⚠️  Railway MySQL credentials not found - database features will be disabled")
+        print("   Create railway_config.py or set MYSQLHOST/MYSQL_HOST environment variables")
+    else:
+        print("✓ Railway MySQL credentials found in environment variables")
+
 from database.init import init_database, database_exists
 from schwab.tokens.storage import token_file_exists, get_token_file_path
 from schwab.tokens.acquisition import acquire_tokens
@@ -26,7 +40,8 @@ from constants.parameters import (
     MARKET_CLOSE_BUFFER_MINUTES,
     MAX_HOLD_TIME_MINUTES,
     ACCOUNT_SIZE_CHECK_INTERVAL_MINUTES,
-    PRT_RECHECK_INTERVAL_SECONDS
+    PRT_RECHECK_INTERVAL_SECONDS,
+    MAX_DRAWDOWN_PERCENT
 )
 from core.controller import GodelTerminalController
 from schwab.account.client import AccountClient
@@ -375,6 +390,29 @@ def verify_stop_losses_for_all_positions(
         traceback.print_exc()
 
 
+def is_market_about_to_close(buffer_minutes: int = MARKET_CLOSE_BUFFER_MINUTES) -> bool:
+    """
+    Check if market is about to close within the buffer time.
+    
+    Args:
+        buffer_minutes: Minutes before market close to consider "about to close"
+    
+    Returns:
+        bool: True if market is about to close, False otherwise
+    """
+    eastern = pytz.timezone('US/Eastern')
+    now_eastern = datetime.now(eastern)
+    current_time = now_eastern.time()
+    
+    # Market closes at 16:00 ET (4:00 PM)
+    # Calculate buffer time (e.g., if buffer is 5 minutes, close at 15:55)
+    buffer_hour = 15
+    buffer_minute = 60 - buffer_minutes
+    buffer_time = datetime.strptime(f"{buffer_hour:02d}:{buffer_minute:02d}", "%H:%M").time()
+    
+    return current_time >= buffer_time
+
+
 def supervisor_loop(account_client: AccountClient, market_data_client: MarketDataClient) -> str:
     """
     Supervisor loop that runs when market is closed.
@@ -395,10 +433,24 @@ def supervisor_loop(account_client: AccountClient, market_data_client: MarketDat
     
     while True:
         try:
+            # Check if market is about to close - if so, don't enter trading mode
+            if is_market_about_to_close():
+                logger.info(f"Market closing soon (within {MARKET_CLOSE_BUFFER_MINUTES} minutes) - staying in supervisor mode")
+                logger.info(f"Waiting {SUPERVISOR_CHECK_INTERVAL_MINUTES} minutes before next check...")
+                time.sleep(SUPERVISOR_CHECK_INTERVAL_MINUTES * 60)
+                continue
+            
             # Check if market is open
             is_open, message = market_data_client.is_market_open(delay_minutes=MARKET_OPEN_DELAY_MINUTES)
             
             if is_open:
+                # Double-check that market is not about to close before transitioning
+                if is_market_about_to_close():
+                    logger.info(f"Market is open but closing soon (within {MARKET_CLOSE_BUFFER_MINUTES} minutes) - staying in supervisor mode")
+                    logger.info(f"Waiting {SUPERVISOR_CHECK_INTERVAL_MINUTES} minutes before next check...")
+                    time.sleep(SUPERVISOR_CHECK_INTERVAL_MINUTES * 60)
+                    continue
+                
                 logger.info(f"✓ {message}")
                 logger.info("Market is ready for trading - transitioning to trading mode")
                 return 'trade'
@@ -450,9 +502,29 @@ def trading_loop(
     last_account_check = datetime.now()
     account_check_interval = timedelta(minutes=ACCOUNT_SIZE_CHECK_INTERVAL_MINUTES)
     
-    # Log initial account size
-    logger.info("Logging initial account size...")
-    account_monitor.log_account_size()
+    # Get initial account value for drawdown monitoring
+    logger.info("Getting initial account value for drawdown monitoring...")
+    initial_metrics = account_monitor.get_account_metrics()
+    initial_account_value = initial_metrics.get('account_value')
+    
+    if initial_account_value is None or initial_account_value == '':
+        logger.error("⚠️  Could not retrieve initial account value - drawdown monitoring disabled")
+        initial_account_value = None
+    else:
+        try:
+            initial_account_value = float(initial_account_value)
+            logger.info(f"✅ Initial account value: ${initial_account_value:,.2f}")
+            logger.info(f"🛡️  Drawdown safeguard active: Will shutdown if account drops {MAX_DRAWDOWN_PERCENT}% (${initial_account_value * MAX_DRAWDOWN_PERCENT / 100:,.2f})")
+        except (ValueError, TypeError):
+            logger.error("⚠️  Invalid initial account value - drawdown monitoring disabled")
+            initial_account_value = None
+    
+    # Log initial account size (only if not about to close)
+    if not is_market_about_to_close():
+        logger.info("Logging initial account size...")
+        account_monitor.log_account_size()
+    else:
+        logger.info("Skipping initial account size log - market closing soon")
     
     try:
         while True:
@@ -464,17 +536,7 @@ def trading_loop(
             
             # Check if market is about to close (within buffer time)
             # Follows RULES.md: Must close positions within 5 minutes of market close
-            eastern = pytz.timezone('US/Eastern')
-            now_eastern = datetime.now(eastern)
-            current_time = now_eastern.time()
-            
-            # Market closes at 16:00 ET (4:00 PM)
-            # Calculate buffer time (e.g., if buffer is 5 minutes, close at 15:55)
-            buffer_hour = 15
-            buffer_minute = 60 - MARKET_CLOSE_BUFFER_MINUTES
-            buffer_time = datetime.strptime(f"{buffer_hour:02d}:{buffer_minute:02d}", "%H:%M").time()
-            
-            if current_time >= buffer_time:
+            if is_market_about_to_close():
                 logger.warning(f"Market closing soon (within {MARKET_CLOSE_BUFFER_MINUTES} minutes) - closing all positions")
                 close_all_positions_before_market_close(order_manager, account_client, reason="market close")
                 break
@@ -503,6 +565,36 @@ def trading_loop(
             if now - last_account_check >= account_check_interval:
                 logger.info("Checking account size...")
                 account_monitor.log_account_size()
+                
+                # Check for drawdown if initial value was recorded
+                if initial_account_value is not None:
+                    current_metrics = account_monitor.get_account_metrics()
+                    current_account_value = current_metrics.get('account_value')
+                    
+                    if current_account_value is not None and current_account_value != '':
+                        try:
+                            current_account_value = float(current_account_value)
+                            drawdown = initial_account_value - current_account_value
+                            drawdown_percent = (drawdown / initial_account_value) * 100
+                            
+                            if drawdown_percent >= MAX_DRAWDOWN_PERCENT:
+                                logger.critical("=" * 60)
+                                logger.critical("🚨 EMERGENCY SHUTDOWN TRIGGERED 🚨")
+                                logger.critical("=" * 60)
+                                logger.critical(f"Account drawdown exceeded threshold!")
+                                logger.critical(f"Initial value: ${initial_account_value:,.2f}")
+                                logger.critical(f"Current value: ${current_account_value:,.2f}")
+                                logger.critical(f"Drawdown: ${drawdown:,.2f} ({drawdown_percent:.2f}%)")
+                                logger.critical(f"Threshold: {MAX_DRAWDOWN_PERCENT}%")
+                                logger.critical("=" * 60)
+                                logger.critical("Closing all positions and shutting down...")
+                                close_all_positions_before_market_close(order_manager, account_client, reason="drawdown safeguard")
+                                raise SystemExit("Emergency shutdown due to drawdown threshold exceeded")
+                            elif drawdown_percent > 0:
+                                logger.warning(f"⚠️  Account drawdown: ${drawdown:,.2f} ({drawdown_percent:.2f}%) - Threshold: {MAX_DRAWDOWN_PERCENT}%")
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Could not parse account value for drawdown check: {e}")
+                
                 last_account_check = now
             
             # Execute rolling strategy cycle
@@ -541,14 +633,7 @@ def trading_loop(
                     break
                 
                 # Check if market is about to close
-                eastern = pytz.timezone('US/Eastern')
-                now_eastern = datetime.now(eastern)
-                current_time = now_eastern.time()
-                buffer_hour = 15
-                buffer_minute = 60 - MARKET_CLOSE_BUFFER_MINUTES
-                buffer_time = datetime.strptime(f"{buffer_hour:02d}:{buffer_minute:02d}", "%H:%M").time()
-                
-                if current_time >= buffer_time:
+                if is_market_about_to_close():
                     logger.warning(f"Market closing soon (within {MARKET_CLOSE_BUFFER_MINUTES} minutes) - closing all positions")
                     close_all_positions_before_market_close(order_manager, account_client, reason="market close")
                     break
@@ -558,6 +643,36 @@ def trading_loop(
                 if now - last_account_check >= account_check_interval:
                     logger.info("Checking account size during wait...")
                     account_monitor.log_account_size()
+                    
+                    # Check for drawdown if initial value was recorded
+                    if initial_account_value is not None:
+                        current_metrics = account_monitor.get_account_metrics()
+                        current_account_value = current_metrics.get('account_value')
+                        
+                        if current_account_value is not None and current_account_value != '':
+                            try:
+                                current_account_value = float(current_account_value)
+                                drawdown = initial_account_value - current_account_value
+                                drawdown_percent = (drawdown / initial_account_value) * 100
+                                
+                                if drawdown_percent >= MAX_DRAWDOWN_PERCENT:
+                                    logger.critical("=" * 60)
+                                    logger.critical("🚨 EMERGENCY SHUTDOWN TRIGGERED 🚨")
+                                    logger.critical("=" * 60)
+                                    logger.critical(f"Account drawdown exceeded threshold!")
+                                    logger.critical(f"Initial value: ${initial_account_value:,.2f}")
+                                    logger.critical(f"Current value: ${current_account_value:,.2f}")
+                                    logger.critical(f"Drawdown: ${drawdown:,.2f} ({drawdown_percent:.2f}%)")
+                                    logger.critical(f"Threshold: {MAX_DRAWDOWN_PERCENT}%")
+                                    logger.critical("=" * 60)
+                                    logger.critical("Closing all positions and shutting down...")
+                                    close_all_positions_before_market_close(order_manager, account_client, reason="drawdown safeguard")
+                                    raise SystemExit("Emergency shutdown due to drawdown threshold exceeded")
+                                elif drawdown_percent > 0:
+                                    logger.warning(f"⚠️  Account drawdown: ${drawdown:,.2f} ({drawdown_percent:.2f}%) - Threshold: {MAX_DRAWDOWN_PERCENT}%")
+                            except (ValueError, TypeError) as e:
+                                logger.warning(f"Could not parse account value for drawdown check: {e}")
+                    
                     last_account_check = now
                 
                 # Log remaining wait time

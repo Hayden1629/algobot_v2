@@ -8,6 +8,7 @@ from datetime import datetime
 import pytz
 from loguru import logger
 from schwab.tokens.manager import get_token_manager
+from constants.parameters import SHOW_ORDER_OUTPUT
 
 
 class MarketDataClient:
@@ -235,7 +236,8 @@ class MarketDataClient:
                     # Response is a dict with symbol as key
                     if symbol.upper() in data:
                         quote_data = data[symbol.upper()]
-                        logger.debug(f"Quote retrieved for {symbol}")
+                        if SHOW_ORDER_OUTPUT:
+                            logger.debug(f"Quote retrieved for {symbol}")
                         return quote_data
                     else:
                         logger.warning(f"Symbol {symbol} not found in quote response")

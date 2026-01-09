@@ -20,6 +20,7 @@ schwab_tokens.json
 
 #passwords
 constants/parameters.py
+railway_config.py
 
 # Logs
 *.log
