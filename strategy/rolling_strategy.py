@@ -134,6 +134,108 @@ class RollingStrategy:
         # Remove from tracker
         self.trade_tracker.remove_trade(ticker)
     
+    def _check_and_update_stop_losses(self) -> int:
+        """
+        Check for stop loss orders that have been filled (triggered) and update database.
+        This should be called after closing positions that no longer meet criteria
+        and before placing new orders.
+        
+        Returns:
+            int: Number of stop losses that were triggered and updated
+        """
+        if not self.order_manager or not self.account_client:
+            return 0
+        
+        triggered_count = 0
+        
+        try:
+            # Get current positions to check which ones still exist
+            current_positions = self.account_client.get_positions() or []
+            current_position_tickers = {
+                pos.get('instrument', {}).get('symbol', '').upper()
+                for pos in current_positions
+            }
+            
+            # Get all tracked stop loss order IDs
+            tracked_trades = self.trade_tracker.trades.copy()  # Copy to avoid modification during iteration
+            stop_loss_order_ids = {}
+            
+            for ticker, trade_info in tracked_trades.items():
+                stop_loss_order_id = trade_info.get('stop_loss_order_id')
+                if stop_loss_order_id:
+                    stop_loss_order_ids[stop_loss_order_id] = ticker
+            
+            if not stop_loss_order_ids:
+                return 0
+            
+            logger.info(f"Checking {len(stop_loss_order_ids)} tracked stop loss orders for fills...")
+            
+            # Check each tracked stop loss order
+            for order_id, ticker in stop_loss_order_ids.items():
+                try:
+                    # First check if position still exists
+                    # If position doesn't exist but we're tracking it, stop loss likely filled
+                    if ticker not in current_position_tickers:
+                        logger.warning(f"⚠️  Stop loss likely triggered for {ticker} (position closed, checking order status...)")
+                        # Verify by checking order status
+                        try:
+                            order_status = self.order_manager.get_order_status(order_id)
+                            status = order_status.get('status', '').upper()
+                            order_type = order_status.get('orderType', '').upper()
+                            
+                            if order_type == 'STOP' and status == 'FILLED':
+                                logger.warning(f"⚠️  Stop loss confirmed triggered for {ticker} (Order ID: {order_id})")
+                                self._close_trade_with_db_update(ticker, order_id)
+                                triggered_count += 1
+                            else:
+                                # Position closed but stop loss not filled - might have been manually closed
+                                logger.debug(f"Position {ticker} closed but stop loss status is {status}")
+                        except Exception as e:
+                            # Can't get order status, but position is closed - assume stop loss filled
+                            logger.warning(f"⚠️  Stop loss likely triggered for {ticker} (position closed, order status unavailable: {e})")
+                            self._close_trade_with_db_update(ticker, order_id)
+                            triggered_count += 1
+                        continue
+                    
+                    # Position still exists, check order status
+                    order_status = self.order_manager.get_order_status(order_id)
+                    status = order_status.get('status', '').upper()
+                    order_type = order_status.get('orderType', '').upper()
+                    
+                    # Only process STOP orders
+                    if order_type != 'STOP':
+                        continue
+                    
+                    if status == 'FILLED':
+                        logger.warning(f"⚠️  Stop loss triggered for {ticker} (Order ID: {order_id})")
+                        # Update database with the filled stop loss order
+                        self._close_trade_with_db_update(ticker, order_id)
+                        triggered_count += 1
+                        
+                    elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                        # Stop loss was canceled/rejected/expired - log but don't update
+                        logger.debug(f"Stop loss order for {ticker} was {status} (Order ID: {order_id})")
+                        # Don't remove from tracker - position still exists, just stop loss was canceled
+                        
+                except Exception as e:
+                    logger.debug(f"Error checking stop loss order {order_id} for {ticker}: {e}")
+                    # If we can't get order status, check if position still exists
+                    if ticker not in current_position_tickers:
+                        # Position doesn't exist, stop loss likely filled
+                        logger.warning(f"⚠️  Stop loss likely triggered for {ticker} (position closed, order check failed)")
+                        self._close_trade_with_db_update(ticker, order_id)
+                        triggered_count += 1
+            
+            if triggered_count > 0:
+                logger.info(f"✓ Updated {triggered_count} trade(s) in database due to stop loss triggers")
+            
+        except Exception as e:
+            logger.error(f"Error checking stop losses: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return triggered_count
+    
     def get_tickers_from_most(self) -> List[str]:
         """
         Get tickers from MOST command.
@@ -731,6 +833,14 @@ class RollingStrategy:
                                     # Wait a moment for market order to fill, then update
                                     time.sleep(1)
                                     self._close_trade_with_db_update(ticker, close_order_id)
+            
+            # Step 9.5: Check for stop losses that were triggered
+            # This runs after closing positions that no longer meet criteria
+            # and before placing new orders
+            logger.info("Checking for triggered stop loss orders...")
+            triggered_stops = self._check_and_update_stop_losses()
+            if triggered_stops > 0:
+                logger.info(f"Found and updated {triggered_stops} stop loss trigger(s)")
             
             # Step 10: Size and execute new trades
             if (new_long_candidates or new_short_candidates) and self.position_sizer and self.trade_executor:

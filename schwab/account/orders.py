@@ -35,7 +35,7 @@ class OrderManager:
         self.account_client = account_client
         self.market_data_client = market_data_client
     
-    def create_order(self, order_payload: Dict, max_retries: int = 5) -> Dict:
+    def create_order(self, order_payload: Dict, max_retries: int = 5, skip_delays: bool = False) -> Dict:
         """
         Create an order via Schwab API.
         Includes retry logic for failed requests.
@@ -43,6 +43,7 @@ class OrderManager:
         Args:
             order_payload: Order payload dictionary
             max_retries: Maximum number of retry attempts
+            skip_delays: If True, skip delays on retries (for urgent orders like stop losses)
         
         Returns:
             dict: API response with order details
@@ -97,9 +98,12 @@ class OrderManager:
                     
             except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 if attempt < max_retries - 1:
-                    wait_time = 2.0 * (2 ** attempt)
-                    logger.warning(f"Connection error creating order (attempt {attempt + 1}/{max_retries}), waiting {wait_time:.1f}s...")
-                    time.sleep(wait_time)
+                    if skip_delays:
+                        logger.warning(f"Connection error creating order (attempt {attempt + 1}/{max_retries}), retrying immediately (no delay)...")
+                    else:
+                        wait_time = 2.0 * (2 ** attempt)
+                        logger.warning(f"Connection error creating order (attempt {attempt + 1}/{max_retries}), waiting {wait_time:.1f}s...")
+                        time.sleep(wait_time)
                     self.account_client._update_headers()
                     headers = self.account_client.headers.copy()
                     headers["Content-Type"] = "application/json"
@@ -327,5 +331,5 @@ class OrderManager:
         
         if SHOW_ORDER_OUTPUT:
             logger.info(f"Creating stop loss order: {ticker} {instruction} {quantity} shares @ ${stop_price:.4f} stop (entry: ${entry_price:.4f}, {stop_loss_percent}% loss)")
-        return self.create_order(order_payload)
+        return self.create_order(order_payload, skip_delays=True)
 

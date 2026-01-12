@@ -703,20 +703,29 @@ def trading_loop(
             
             # Wait before next cycle with periodic checks
             # CRITICAL: Use PRT_RECHECK_INTERVAL_SECONDS parameter (not hardcoded)
-            # Break up the wait into smaller chunks to allow market monitoring and account size checks
+            # Use timer-based approach: calculate end time and check against it
+            # This ensures we wait the full duration regardless of API call delays
             wait_seconds = PRT_RECHECK_INTERVAL_SECONDS
+            wait_start_time = datetime.now()
+            wait_end_time = wait_start_time + timedelta(seconds=wait_seconds)
+            
             logger.warning(f"⏸️  Waiting {wait_seconds} seconds ({wait_seconds / 60:.1f} minutes) before next PRT cycle...")
             logger.warning(f"   (Parameter PRT_RECHECK_INTERVAL_SECONDS = {PRT_RECHECK_INTERVAL_SECONDS})")
+            logger.warning(f"   Wait started at {wait_start_time.strftime('%H:%M:%S')}, will end at {wait_end_time.strftime('%H:%M:%S')}")
             
-            # Break wait into 30-second chunks to allow monitoring
-            chunk_size = 30  # Check every 30 seconds
-            remaining_seconds = wait_seconds
+            # Check interval for monitoring (smaller chunks for more responsive checks)
+            check_interval = 30  # Check every 30 seconds
             
-            while remaining_seconds > 0:
-                # Sleep for chunk_size seconds or remaining time, whichever is smaller
-                sleep_time = min(chunk_size, remaining_seconds)
+            while datetime.now() < wait_end_time:
+                # Calculate remaining time
+                remaining = (wait_end_time - datetime.now()).total_seconds()
+                
+                if remaining <= 0:
+                    break
+                
+                # Sleep for check_interval or remaining time, whichever is smaller
+                sleep_time = min(check_interval, remaining)
                 time.sleep(sleep_time)
-                remaining_seconds -= sleep_time
                 
                 # Check market status during wait
                 is_open, message = market_data_client.is_market_open(delay_minutes=0)
@@ -776,8 +785,9 @@ def trading_loop(
                     last_account_check = now
                 
                 # Log remaining wait time
-                if remaining_seconds > 0:
-                    logger.debug(f"  {remaining_seconds} seconds remaining in wait period...")
+                remaining = (wait_end_time - datetime.now()).total_seconds()
+                if remaining > 0:
+                    logger.debug(f"  {int(remaining)} seconds remaining in wait period...")
             
     except KeyboardInterrupt:
         logger.info("Trading loop interrupted by user")

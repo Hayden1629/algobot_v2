@@ -358,6 +358,8 @@ class PositionSizer:
         target_short = max(min_target, min(target_short, max_target))
         
         # Verify the projected net is within limits
+        # NOTE: This projection assumes all candidates will be executed at exact target values
+        # Actual execution may differ due to: share rounding, price changes, partial fills
         projected_net = current_net + (num_long * target_long - num_short * target_short)
         
         # If still over limit, iteratively adjust
@@ -382,6 +384,11 @@ class PositionSizer:
             logger.warning(f"After {iteration} adjustments, projected net=${projected_net:,.2f} still exceeds limit ${max_net_exposure:,.2f}")
         else:
             logger.info(f"Balanced sizing: LONG=${target_long:,.2f} ({target_long/base_target_value:.1f}x), SHORT=${target_short:,.2f} ({target_short/base_target_value:.1f}x), projected net=${projected_net:,.2f}")
+            logger.debug(f"Projection details: current_net=${current_net:,.2f}, num_long={num_long}, num_short={num_short}, target_long_total=${num_long * target_long:,.2f}, target_short_total=${num_short * target_short:,.2f}")
+            logger.warning(f"⚠️  NOTE: Projected net assumes ideal target values. Actual net will differ due to:")
+            logger.warning(f"   1. Share rounding (shares must be whole numbers, rounded down)")
+            logger.warning(f"   2. Price changes between sizing and execution")
+            logger.warning(f"   3. Market values vs entry values (actual exposure uses current market prices)")
         
         return target_long, target_short
     
@@ -572,12 +579,20 @@ class PositionSizer:
         total_net_exposure = total_long_exposure - total_short_exposure
         total_exposure_after = total_long_exposure + total_short_exposure
         
+        # Calculate what the projection expected vs what we actually sized
+        expected_long_total = len(long_candidates) * target_long_value if long_candidates else 0
+        expected_short_total = len(short_candidates) * target_short_value if short_candidates else 0
+        expected_net = current_net + (expected_long_total - expected_short_total)
+        
         logger.info("=" * 60)
         logger.info(f"Position Sizing Complete")
         logger.info(f"Total trades sized: {len(sized_trades)}")
         logger.info(f"Total allocated: ${total_allocated:,.2f} / ${available_buying_power:,.2f} ({total_allocated/available_buying_power*100:.1f}% of available)")
         logger.info(f"Long exposure: ${total_long_exposure:,.2f} | Short exposure: ${total_short_exposure:,.2f} | Net: ${total_net_exposure:,.2f}")
         logger.info(f"Total exposure after: ${total_exposure_after:,.2f} / ${allocatable_buying_power:,.2f} ({total_exposure_after/allocatable_buying_power*100:.1f}% of allocatable)")
+        logger.debug(f"Projection vs Actual: Expected net=${expected_net:,.2f}, Actual sized net=${total_net_exposure:,.2f}, Difference=${total_net_exposure - expected_net:,.2f}")
+        logger.debug(f"  Expected: LONG=${expected_long_total:,.2f}, SHORT=${expected_short_total:,.2f}")
+        logger.debug(f"  Actual sized: LONG=${new_long_exposure:,.2f}, SHORT=${new_short_exposure:,.2f}")
         logger.info("=" * 60)
         
         return sized_trades

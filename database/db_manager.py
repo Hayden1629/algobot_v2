@@ -279,6 +279,11 @@ class DatabaseManager:
             
             action, quantity = trade_info
             
+            # Convert database Decimal types to float for calculations
+            entry_price = float(entry_price) if entry_price is not None else 0.0
+            quantity = float(quantity) if quantity is not None else 0.0
+            exit_price = float(exit_price) if exit_price is not None else 0.0
+            
             # Calculate profit/loss
             if action == 'LONG':
                 profit_loss = (exit_price - entry_price) * quantity
