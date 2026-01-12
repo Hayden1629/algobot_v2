@@ -91,6 +91,7 @@ class RollingStrategy:
     def _close_trade_with_db_update(self, ticker: str, order_id: Optional[str] = None) -> None:
         """
         Close a trade and update it in the database.
+        CRITICAL: Always updates database, even if exit price retrieval fails (uses fallback).
         
         Args:
             ticker: Stock ticker symbol
@@ -99,37 +100,115 @@ class RollingStrategy:
         exit_price = None
         
         # Try to get exit price from order status if order_id provided
-        if order_id:
+        if order_id and self.order_manager:
             try:
                 order_status = self.order_manager.get_order_status(order_id)
-                if 'averageFillPrice' in order_status:
-                    exit_price = float(order_status['averageFillPrice'])
-                elif 'price' in order_status:
-                    exit_price = float(order_status['price'])
-            except:
-                pass
+                
+                # Check for error in response
+                if 'error' in order_status:
+                    logger.debug(f"Error getting order status for {order_id}: {order_status.get('error')}")
+                else:
+                    # Try top-level averageFillPrice first
+                    if 'averageFillPrice' in order_status:
+                        exit_price = float(order_status['averageFillPrice'])
+                        logger.debug(f"Got exit price from top-level averageFillPrice for {ticker}: ${exit_price:.2f}")
+                    # Try orderLegCollection (for stop loss orders, fill price is often here)
+                    elif 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
+                        leg = order_status['orderLegCollection'][0]
+                        # Check executionDetails first (most accurate for filled orders)
+                        if 'executionDetails' in leg and leg['executionDetails']:
+                            executions = leg['executionDetails']
+                            if executions:
+                                # Calculate average fill price from all executions
+                                total_price = 0
+                                total_quantity = 0
+                                for execution in executions:
+                                    if 'price' in execution and 'quantity' in execution:
+                                        total_price += execution['price'] * execution['quantity']
+                                        total_quantity += execution['quantity']
+                                if total_quantity > 0:
+                                    exit_price = total_price / total_quantity
+                                    logger.debug(f"Got exit price from executionDetails for {ticker}: ${exit_price:.2f}")
+                        # Fallback to other leg fields
+                        if exit_price is None:
+                            if 'averageFillPrice' in leg:
+                                exit_price = float(leg['averageFillPrice'])
+                                logger.debug(f"Got exit price from orderLegCollection averageFillPrice for {ticker}: ${exit_price:.2f}")
+                            elif 'averagePrice' in leg:
+                                exit_price = float(leg['averagePrice'])
+                                logger.debug(f"Got exit price from orderLegCollection averagePrice for {ticker}: ${exit_price:.2f}")
+                            elif 'filledPrice' in leg:
+                                exit_price = float(leg['filledPrice'])
+                                logger.debug(f"Got exit price from orderLegCollection filledPrice for {ticker}: ${exit_price:.2f}")
+                            elif 'price' in leg:
+                                exit_price = float(leg['price'])
+                                logger.debug(f"Got exit price from orderLegCollection price for {ticker}: ${exit_price:.2f}")
+                    # Try top-level price
+                    elif 'price' in order_status:
+                        exit_price = float(order_status['price'])
+                        logger.debug(f"Got exit price from top-level price for {ticker}: ${exit_price:.2f}")
+                    else:
+                        # Log available fields for debugging
+                        available_fields = list(order_status.keys())
+                        logger.warning(f"⚠️  Order status for {order_id} ({ticker}) does not contain fill price fields. Available fields: {available_fields}")
+                        # Check if orderLegCollection exists but is empty
+                        if 'orderLegCollection' in order_status:
+                            logger.warning(f"   orderLegCollection exists but is empty or doesn't have fill price")
+                        # Log the full order status for debugging (truncated)
+                        logger.debug(f"   Order status sample: {str(order_status)[:500]}")
+            except Exception as e:
+                logger.debug(f"Could not get exit price from order {order_id} for {ticker}: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
         
-        # Fallback: get current quote
-        if exit_price is None:
+        # Fallback 1: get current quote
+        if exit_price is None and self.market_data_client:
             try:
                 quote = self.market_data_client.get_quote(ticker)
                 if quote:
                     exit_price = quote.get('lastPrice') or quote.get('last')
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not get quote for {ticker}: {e}")
         
-        # Update trade in database
-        if self.db_manager and self.db_manager.is_available() and exit_price:
+        # Fallback 2: get entry price from database as last resort
+        if exit_price is None and self.db_manager and self.db_manager.is_available():
+            try:
+                cursor = self.db_manager.connection.cursor()
+                find_query = "SELECT entry_price FROM trades WHERE ticker = %s AND is_closed = FALSE ORDER BY time_placed DESC LIMIT 1"
+                cursor.execute(find_query, (ticker.upper(),))
+                trade = cursor.fetchone()
+                cursor.close()
+                if trade and trade[0]:
+                    exit_price = float(trade[0])
+                    logger.warning(f"⚠️  Using entry price as fallback exit price for {ticker} (could not get actual exit price)")
+            except Exception as e:
+                logger.debug(f"Could not get entry price from database for {ticker}: {e}")
+        
+        # CRITICAL: Always update trade in database, even if exit_price is None
+        # This ensures the trade is marked as closed in all scenarios
+        if self.db_manager and self.db_manager.is_available():
             try:
                 from datetime import datetime
                 import pytz
+                
+                # If we still don't have an exit price, use 0.0 as absolute last resort
+                # This ensures the trade is marked as closed, even if we can't get the price
+                if exit_price is None:
+                    exit_price = 0.0
+                    logger.error(f"❌ CRITICAL: Could not get exit price for {ticker} - using 0.0 as fallback. Trade will be marked as closed but P&L may be incorrect.")
+                
                 self.db_manager.update_trade_on_close(
                     ticker,
                     exit_price,
                     datetime.now(pytz.UTC)
                 )
+                logger.info(f"✓ Updated trade {ticker} in database (exit price: ${exit_price:.2f})")
             except Exception as e:
-                logger.debug(f"Could not update trade in database for {ticker}: {e}")
+                logger.error(f"❌ CRITICAL: Could not update trade in database for {ticker}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning(f"⚠️  Database not available - could not update trade {ticker} in database")
         
         # Remove from tracker
         self.trade_tracker.remove_trade(ticker)

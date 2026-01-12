@@ -266,30 +266,102 @@ def close_all_positions_before_market_close(
             order_id = result.get('orderId') if isinstance(result, dict) else None
             logger.info(f"Closed short position: {symbol} {short_qty} shares")
         
-        # Update trade in database if db_manager is available
-        if db_manager and db_manager.is_available() and exit_price:
+        # CRITICAL: Always update trade in database, even if exit price retrieval fails
+        if db_manager and db_manager.is_available():
             try:
                 from datetime import datetime
                 import pytz
-                # Try to get exit price from order if available
+                
+                # Try to get exit price from order if available (more accurate than quote)
                 if order_id:
                     try:
                         order_status = order_manager.get_order_status(order_id)
-                        if 'averageFillPrice' in order_status:
-                            exit_price = float(order_status['averageFillPrice'])
-                        elif 'price' in order_status:
-                            exit_price = float(order_status['price'])
-                    except:
-                        pass  # Use quote price if order status unavailable
+                        
+                        # Check for error in response
+                        if 'error' not in order_status:
+                            # Try top-level averageFillPrice first
+                            if 'averageFillPrice' in order_status:
+                                exit_price = float(order_status['averageFillPrice'])
+                                logger.debug(f"Got exit price from top-level averageFillPrice for {symbol}: ${exit_price:.2f}")
+                            # Try orderLegCollection (for stop loss orders, fill price is often here)
+                            elif 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
+                                leg = order_status['orderLegCollection'][0]
+                                # Check executionDetails first (most accurate for filled orders)
+                                if 'executionDetails' in leg and leg['executionDetails']:
+                                    executions = leg['executionDetails']
+                                    if executions:
+                                        # Calculate average fill price from all executions
+                                        total_price = 0
+                                        total_quantity = 0
+                                        for execution in executions:
+                                            if 'price' in execution and 'quantity' in execution:
+                                                total_price += execution['price'] * execution['quantity']
+                                                total_quantity += execution['quantity']
+                                        if total_quantity > 0:
+                                            exit_price = total_price / total_quantity
+                                            logger.debug(f"Got exit price from executionDetails for {symbol}: ${exit_price:.2f}")
+                                # Fallback to other leg fields
+                                if exit_price is None:
+                                    if 'averageFillPrice' in leg:
+                                        exit_price = float(leg['averageFillPrice'])
+                                        logger.debug(f"Got exit price from orderLegCollection averageFillPrice for {symbol}: ${exit_price:.2f}")
+                                    elif 'averagePrice' in leg:
+                                        exit_price = float(leg['averagePrice'])
+                                        logger.debug(f"Got exit price from orderLegCollection averagePrice for {symbol}: ${exit_price:.2f}")
+                                    elif 'filledPrice' in leg:
+                                        exit_price = float(leg['filledPrice'])
+                                        logger.debug(f"Got exit price from orderLegCollection filledPrice for {symbol}: ${exit_price:.2f}")
+                                    elif 'price' in leg:
+                                        exit_price = float(leg['price'])
+                                        logger.debug(f"Got exit price from orderLegCollection price for {symbol}: ${exit_price:.2f}")
+                            # Try top-level price
+                            elif 'price' in order_status:
+                                exit_price = float(order_status['price'])
+                                logger.debug(f"Got exit price from top-level price for {symbol}: ${exit_price:.2f}")
+                    except Exception as e:
+                        logger.debug(f"Could not get exit price from order {order_id} for {symbol}: {e}")
+                
+                # Fallback: get current quote if we still don't have exit price
+                if exit_price is None and market_data_client:
+                    try:
+                        quote = market_data_client.get_quote(symbol)
+                        if quote:
+                            exit_price = quote.get('lastPrice') or quote.get('last')
+                    except Exception as e:
+                        logger.debug(f"Could not get quote for {symbol}: {e}")
+                
+                # Fallback: get entry price from database as last resort
+                if exit_price is None:
+                    try:
+                        cursor = db_manager.connection.cursor()
+                        find_query = "SELECT entry_price FROM trades WHERE ticker = %s AND is_closed = FALSE ORDER BY time_placed DESC LIMIT 1"
+                        cursor.execute(find_query, (symbol.upper(),))
+                        trade = cursor.fetchone()
+                        cursor.close()
+                        if trade and trade[0]:
+                            exit_price = float(trade[0])
+                            logger.warning(f"⚠️  Using entry price as fallback exit price for {symbol} (could not get actual exit price)")
+                    except Exception as e:
+                        logger.debug(f"Could not get entry price from database for {symbol}: {e}")
+                
+                # If we still don't have an exit price, use 0.0 as absolute last resort
+                # This ensures the trade is marked as closed, even if we can't get the price
+                if exit_price is None:
+                    exit_price = 0.0
+                    logger.error(f"❌ CRITICAL: Could not get exit price for {symbol} - using 0.0 as fallback. Trade will be marked as closed but P&L may be incorrect.")
                 
                 db_manager.update_trade_on_close(
                     symbol,
                     exit_price,
                     datetime.now(pytz.UTC)
                 )
-                logger.debug(f"Updated trade {symbol} in database (exit price: ${exit_price:.2f})")
+                logger.info(f"✓ Updated trade {symbol} in database (exit price: ${exit_price:.2f})")
             except Exception as e:
-                logger.debug(f"Could not update trade {symbol} in database: {e}")
+                logger.error(f"❌ CRITICAL: Could not update trade {symbol} in database: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        elif db_manager:
+            logger.warning(f"⚠️  Database not available - could not update trade {symbol} in database")
 
 
 def verify_stop_losses_for_all_positions(
@@ -625,28 +697,91 @@ def trading_loop(
                                 order_id = result.get('orderId') if isinstance(result, dict) else None
                                 trade_tracker.remove_trade(symbol)
                             
-                            # Update trade in database if db_manager is available
-                            if db_mgr and db_mgr.is_available() and exit_price:
+                            # CRITICAL: Always update trade in database, even if exit price retrieval fails
+                            if db_mgr and db_mgr.is_available():
                                 try:
-                                    # Try to get exit price from order if available
+                                    # Try to get exit price from order if available (more accurate than quote)
                                     if order_id:
                                         try:
                                             order_status = order_manager.get_order_status(order_id)
-                                            if 'averageFillPrice' in order_status:
-                                                exit_price = float(order_status['averageFillPrice'])
-                                            elif 'price' in order_status:
-                                                exit_price = float(order_status['price'])
-                                        except:
-                                            pass  # Use quote price if order status unavailable
+                                            
+                                            # Check for error in response
+                                            if 'error' not in order_status:
+                                                # Try top-level averageFillPrice first
+                                                if 'averageFillPrice' in order_status:
+                                                    exit_price = float(order_status['averageFillPrice'])
+                                                # Try orderLegCollection (for stop loss orders, fill price is often here)
+                                                elif 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
+                                                    leg = order_status['orderLegCollection'][0]
+                                                    # Check executionDetails first (most accurate for filled orders)
+                                                    if 'executionDetails' in leg and leg['executionDetails']:
+                                                        executions = leg['executionDetails']
+                                                        if executions:
+                                                            # Calculate average fill price from all executions
+                                                            total_price = 0
+                                                            total_quantity = 0
+                                                            for execution in executions:
+                                                                if 'price' in execution and 'quantity' in execution:
+                                                                    total_price += execution['price'] * execution['quantity']
+                                                                    total_quantity += execution['quantity']
+                                                            if total_quantity > 0:
+                                                                exit_price = total_price / total_quantity
+                                                    # Fallback to other leg fields
+                                                    if exit_price is None:
+                                                        if 'averageFillPrice' in leg:
+                                                            exit_price = float(leg['averageFillPrice'])
+                                                        elif 'averagePrice' in leg:
+                                                            exit_price = float(leg['averagePrice'])
+                                                        elif 'filledPrice' in leg:
+                                                            exit_price = float(leg['filledPrice'])
+                                                        elif 'price' in leg:
+                                                            exit_price = float(leg['price'])
+                                                # Try top-level price
+                                                elif 'price' in order_status:
+                                                    exit_price = float(order_status['price'])
+                                        except Exception as e:
+                                            logger.debug(f"Could not get exit price from order {order_id} for {symbol}: {e}")
+                                    
+                                    # Fallback: get current quote if we still don't have exit price
+                                    if exit_price is None and market_data_client:
+                                        try:
+                                            quote = market_data_client.get_quote(symbol)
+                                            if quote:
+                                                exit_price = quote.get('lastPrice') or quote.get('last')
+                                        except Exception as e:
+                                            logger.debug(f"Could not get quote for {symbol}: {e}")
+                                    
+                                    # Fallback: get entry price from database as last resort
+                                    if exit_price is None:
+                                        try:
+                                            cursor = db_mgr.connection.cursor()
+                                            find_query = "SELECT entry_price FROM trades WHERE ticker = %s AND is_closed = FALSE ORDER BY time_placed DESC LIMIT 1"
+                                            cursor.execute(find_query, (symbol.upper(),))
+                                            trade = cursor.fetchone()
+                                            cursor.close()
+                                            if trade and trade[0]:
+                                                exit_price = float(trade[0])
+                                                logger.warning(f"⚠️  Using entry price as fallback exit price for {symbol} (could not get actual exit price)")
+                                        except Exception as e:
+                                            logger.debug(f"Could not get entry price from database for {symbol}: {e}")
+                                    
+                                    # If we still don't have an exit price, use 0.0 as absolute last resort
+                                    if exit_price is None:
+                                        exit_price = 0.0
+                                        logger.error(f"❌ CRITICAL: Could not get exit price for {symbol} - using 0.0 as fallback. Trade will be marked as closed but P&L may be incorrect.")
                                     
                                     db_mgr.update_trade_on_close(
                                         symbol,
                                         exit_price,
                                         datetime.now(pytz.UTC)
                                     )
-                                    logger.debug(f"Updated expired trade {symbol} in database (exit price: ${exit_price:.2f})")
+                                    logger.info(f"✓ Updated expired trade {symbol} in database (exit price: ${exit_price:.2f})")
                                 except Exception as e:
-                                    logger.debug(f"Could not update expired trade {symbol} in database: {e}")
+                                    logger.error(f"❌ CRITICAL: Could not update expired trade {symbol} in database: {e}")
+                                    import traceback
+                                    logger.error(traceback.format_exc())
+                            elif db_mgr:
+                                logger.warning(f"⚠️  Database not available - could not update expired trade {symbol} in database")
             
             # Check and log account size periodically
             now = datetime.now()
@@ -815,6 +950,7 @@ def main():
     market_data_client = None
     order_manager = None
     controller = None
+    strategy = None  # Store strategy reference for cleanup handlers
     
     try:
         logger.info("Initializing Schwab API clients...")
@@ -831,7 +967,12 @@ def main():
     def cleanup_on_exit():
         if account_client and order_manager:
             logger.warning("Program exiting - closing all positions...")
-            close_all_positions_before_market_close(order_manager, account_client, reason="program exit")
+            # Get db_manager from strategy if available
+            db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
+            close_all_positions_before_market_close(
+                order_manager, account_client, reason="program exit",
+                db_manager=db_mgr, market_data_client=market_data_client
+            )
     
     atexit.register(cleanup_on_exit)
     
@@ -839,7 +980,12 @@ def main():
     def signal_handler(signum, frame):
         logger.warning(f"Received signal {signum} - closing all positions and exiting...")
         if account_client and order_manager:
-            close_all_positions_before_market_close(order_manager, account_client, reason="signal handler")
+            # Get db_manager from strategy if available
+            db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
+            close_all_positions_before_market_close(
+                order_manager, account_client, reason="signal handler",
+                db_manager=db_mgr, market_data_client=market_data_client
+            )
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
@@ -882,6 +1028,7 @@ def main():
             # Initialize strategy and tracker
             trade_tracker = TradeTracker()
             strategy = RollingStrategy(controller, account_client, market_data_client, trade_tracker, order_manager)
+            # Store strategy reference for cleanup handlers (needed for db_manager access)
             
             # Run the trading loop
             logger.info("=" * 60)
@@ -912,7 +1059,12 @@ def main():
     
     if account_client and order_manager:
         logger.warning("Closing all positions...")
-        close_all_positions_before_market_close(order_manager, account_client, reason="shutdown")
+        # Get db_manager from strategy if available
+        db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
+        close_all_positions_before_market_close(
+            order_manager, account_client, reason="shutdown",
+            db_manager=db_mgr, market_data_client=market_data_client
+        )
     
     if controller:
         try:

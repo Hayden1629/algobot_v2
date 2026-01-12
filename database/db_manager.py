@@ -287,10 +287,12 @@ class DatabaseManager:
             # Calculate profit/loss
             if action == 'LONG':
                 profit_loss = (exit_price - entry_price) * quantity
+                # Profit percent for LONG: ((exit_price - entry_price) / entry_price) * 100
+                profit_loss_percent = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
             else:  # SHORT
                 profit_loss = (entry_price - exit_price) * quantity
-            
-            profit_loss_percent = (profit_loss / (entry_price * quantity)) * 100 if entry_price > 0 and quantity > 0 else 0
+                # Profit percent for SHORT: ((entry_price - exit_price) / entry_price) * 100
+                profit_loss_percent = ((entry_price - exit_price) / entry_price) * 100 if entry_price > 0 else 0
             
             # Calculate hold time
             if time_placed:
@@ -328,7 +330,7 @@ class DatabaseManager:
             
             self.connection.commit()
             cursor.close()
-            logger.debug(f"Trade updated on close: ID {trade_id}, Exit price ${exit_price:.2f}, P&L ${profit_loss:.2f}")
+            logger.info(f"✓ Trade updated on close: ID {trade_id}, Ticker {ticker}, Exit price ${exit_price:.2f}, Entry price ${entry_price:.2f}, P&L ${profit_loss:.2f} ({profit_loss_percent:.2f}%)")
             return True
             
         except Error as e:
