@@ -337,6 +337,16 @@ class RollingStrategy:
             logger.error(f"Error running PRT analysis: {e}")
             return None
         finally:
+            # Delete the CSV file after use to avoid cluttering the Downloads folder
+            if cmd and hasattr(cmd, 'csv_file_path') and cmd.csv_file_path:
+                try:
+                    import os
+                    if os.path.exists(cmd.csv_file_path):
+                        os.remove(cmd.csv_file_path)
+                        logger.debug(f"Deleted PRT CSV file: {cmd.csv_file_path}")
+                except Exception as e:
+                    logger.debug(f"Could not delete PRT CSV file {cmd.csv_file_path}: {e}")
+            
             # Always close the PRT window after extracting data
             if cmd and hasattr(cmd, 'close'):
                 try:

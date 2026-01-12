@@ -9,6 +9,7 @@ import time
 import signal
 import atexit
 from datetime import datetime, timedelta
+from typing import Optional
 import pytz
 import os
 
@@ -31,6 +32,7 @@ except ImportError:
         print("✓ Railway MySQL credentials found in environment variables")
 
 from database.init import init_database, database_exists
+from database.db_manager import DatabaseManager
 from schwab.tokens.storage import token_file_exists, get_token_file_path
 from schwab.tokens.acquisition import acquire_tokens
 from constants.parameters import (
@@ -131,17 +133,22 @@ def initialize_godel_controller(headless: bool = False) -> GodelTerminalControll
 def close_all_positions_before_market_close(
     order_manager: OrderManager,
     account_client: AccountClient,
-    reason: str = "market close"
+    reason: str = "market close",
+    db_manager: Optional[DatabaseManager] = None,
+    market_data_client: Optional[MarketDataClient] = None
 ) -> None:
     """
     Close all positions before market close (emergency use).
     Follows RULES.md: Must close positions within 5 minutes of market close.
     Cancels all outstanding orders (including stop losses) before closing positions.
+    Updates trades in database with exit prices and profit/loss if db_manager is provided.
     
     Args:
         order_manager: Order manager instance
         account_client: Account client instance
         reason: Reason for closing positions
+        db_manager: Optional database manager to update trades
+        market_data_client: Optional market data client to get exit prices
     """
     logger.error("=" * 60)
     logger.error(f"EMERGENCY: Closing all positions - {reason}")
@@ -238,13 +245,51 @@ def close_all_positions_before_market_close(
         if not symbol:
             continue
         
+        # Get exit price before closing (for database update)
+        exit_price = None
+        if db_manager and market_data_client and db_manager.is_available():
+            try:
+                quote = market_data_client.get_quote(symbol)
+                if quote:
+                    exit_price = quote.get('lastPrice') or quote.get('last')
+            except Exception as e:
+                logger.debug(f"Could not get quote for {symbol}: {e}")
+        
+        order_id = None
         if long_qty > 0:
-            order_manager.create_market_order(symbol, "SELL", int(long_qty))
+            result = order_manager.create_market_order(symbol, "SELL", int(long_qty))
+            order_id = result.get('orderId') if isinstance(result, dict) else None
             logger.info(f"Closed long position: {symbol} {long_qty} shares")
         
         if short_qty > 0:
-            order_manager.create_market_order(symbol, "BUY_TO_COVER", int(short_qty))
+            result = order_manager.create_market_order(symbol, "BUY_TO_COVER", int(short_qty))
+            order_id = result.get('orderId') if isinstance(result, dict) else None
             logger.info(f"Closed short position: {symbol} {short_qty} shares")
+        
+        # Update trade in database if db_manager is available
+        if db_manager and db_manager.is_available() and exit_price:
+            try:
+                from datetime import datetime
+                import pytz
+                # Try to get exit price from order if available
+                if order_id:
+                    try:
+                        order_status = order_manager.get_order_status(order_id)
+                        if 'averageFillPrice' in order_status:
+                            exit_price = float(order_status['averageFillPrice'])
+                        elif 'price' in order_status:
+                            exit_price = float(order_status['price'])
+                    except:
+                        pass  # Use quote price if order status unavailable
+                
+                db_manager.update_trade_on_close(
+                    symbol,
+                    exit_price,
+                    datetime.now(pytz.UTC)
+                )
+                logger.debug(f"Updated trade {symbol} in database (exit price: ${exit_price:.2f})")
+            except Exception as e:
+                logger.debug(f"Could not update trade {symbol} in database: {e}")
 
 
 def verify_stop_losses_for_all_positions(
@@ -538,7 +583,12 @@ def trading_loop(
             # Follows RULES.md: Must close positions within 5 minutes of market close
             if is_market_about_to_close():
                 logger.warning(f"Market closing soon (within {MARKET_CLOSE_BUFFER_MINUTES} minutes) - closing all positions")
-                close_all_positions_before_market_close(order_manager, account_client, reason="market close")
+                # Pass db_manager and market_data_client from strategy if available
+                db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
+                close_all_positions_before_market_close(
+                    order_manager, account_client, reason="market close",
+                    db_manager=db_mgr, market_data_client=market_data_client
+                )
                 break
             
             # Check for expired trades (exceeding max hold time)
@@ -547,18 +597,56 @@ def trading_loop(
                 logger.info(f"Found {len(expired_trades)} expired trade(s) - closing positions")
                 positions = account_client.get_positions()
                 if positions:
+                    # Get db_manager from strategy if available
+                    db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
                     for pos in positions:
                         symbol = pos.get('instrument', {}).get('symbol', '').upper()
                         if symbol in expired_trades:
                             long_qty = pos.get('longQuantity', 0)
                             short_qty = pos.get('shortQuantity', 0)
                             
+                            # Get exit price before closing (for database update)
+                            exit_price = None
+                            if db_mgr and market_data_client and db_mgr.is_available():
+                                try:
+                                    quote = market_data_client.get_quote(symbol)
+                                    if quote:
+                                        exit_price = quote.get('lastPrice') or quote.get('last')
+                                except Exception as e:
+                                    logger.debug(f"Could not get quote for {symbol}: {e}")
+                            
+                            order_id = None
                             if long_qty > 0:
-                                order_manager.create_market_order(symbol, "SELL", int(long_qty))
+                                result = order_manager.create_market_order(symbol, "SELL", int(long_qty))
+                                order_id = result.get('orderId') if isinstance(result, dict) else None
                                 trade_tracker.remove_trade(symbol)
                             elif short_qty > 0:
-                                order_manager.create_market_order(symbol, "BUY_TO_COVER", int(short_qty))
+                                result = order_manager.create_market_order(symbol, "BUY_TO_COVER", int(short_qty))
+                                order_id = result.get('orderId') if isinstance(result, dict) else None
                                 trade_tracker.remove_trade(symbol)
+                            
+                            # Update trade in database if db_manager is available
+                            if db_mgr and db_mgr.is_available() and exit_price:
+                                try:
+                                    # Try to get exit price from order if available
+                                    if order_id:
+                                        try:
+                                            order_status = order_manager.get_order_status(order_id)
+                                            if 'averageFillPrice' in order_status:
+                                                exit_price = float(order_status['averageFillPrice'])
+                                            elif 'price' in order_status:
+                                                exit_price = float(order_status['price'])
+                                        except:
+                                            pass  # Use quote price if order status unavailable
+                                    
+                                    db_mgr.update_trade_on_close(
+                                        symbol,
+                                        exit_price,
+                                        datetime.now(pytz.UTC)
+                                    )
+                                    logger.debug(f"Updated expired trade {symbol} in database (exit price: ${exit_price:.2f})")
+                                except Exception as e:
+                                    logger.debug(f"Could not update expired trade {symbol} in database: {e}")
             
             # Check and log account size periodically
             now = datetime.now()
@@ -588,7 +676,11 @@ def trading_loop(
                                 logger.critical(f"Threshold: {MAX_DRAWDOWN_PERCENT}%")
                                 logger.critical("=" * 60)
                                 logger.critical("Closing all positions and shutting down...")
-                                close_all_positions_before_market_close(order_manager, account_client, reason="drawdown safeguard")
+                                db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
+                                close_all_positions_before_market_close(
+                                    order_manager, account_client, reason="drawdown safeguard",
+                                    db_manager=db_mgr, market_data_client=market_data_client
+                                )
                                 raise SystemExit("Emergency shutdown due to drawdown threshold exceeded")
                             elif drawdown_percent > 0:
                                 logger.warning(f"⚠️  Account drawdown: ${drawdown:,.2f} ({drawdown_percent:.2f}%) - Threshold: {MAX_DRAWDOWN_PERCENT}%")
@@ -635,7 +727,11 @@ def trading_loop(
                 # Check if market is about to close
                 if is_market_about_to_close():
                     logger.warning(f"Market closing soon (within {MARKET_CLOSE_BUFFER_MINUTES} minutes) - closing all positions")
-                    close_all_positions_before_market_close(order_manager, account_client, reason="market close")
+                    db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
+                    close_all_positions_before_market_close(
+                        order_manager, account_client, reason="market close",
+                        db_manager=db_mgr, market_data_client=market_data_client
+                    )
                     break
                 
                 # Check and log account size periodically during wait
@@ -666,7 +762,11 @@ def trading_loop(
                                     logger.critical(f"Threshold: {MAX_DRAWDOWN_PERCENT}%")
                                     logger.critical("=" * 60)
                                     logger.critical("Closing all positions and shutting down...")
-                                    close_all_positions_before_market_close(order_manager, account_client, reason="drawdown safeguard")
+                                    db_mgr = strategy.db_manager if strategy and hasattr(strategy, 'db_manager') else None
+                                    close_all_positions_before_market_close(
+                                        order_manager, account_client, reason="drawdown safeguard",
+                                        db_manager=db_mgr, market_data_client=market_data_client
+                                    )
                                     raise SystemExit("Emergency shutdown due to drawdown threshold exceeded")
                                 elif drawdown_percent > 0:
                                     logger.warning(f"⚠️  Account drawdown: ${drawdown:,.2f} ({drawdown_percent:.2f}%) - Threshold: {MAX_DRAWDOWN_PERCENT}%")
