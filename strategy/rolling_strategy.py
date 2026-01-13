@@ -108,12 +108,30 @@ class RollingStrategy:
                 if 'error' in order_status:
                     logger.debug(f"Error getting order status for {order_id}: {order_status.get('error')}")
                 else:
-                    # Try top-level averageFillPrice first
-                    if 'averageFillPrice' in order_status:
+                    # Method 1: Try orderActivityCollection (most reliable for filled stop loss orders)
+                    if 'orderActivityCollection' in order_status and order_status['orderActivityCollection']:
+                        for activity in order_status['orderActivityCollection']:
+                            if activity.get('activityType') == 'EXECUTION':
+                                exec_legs = activity.get('executionLegs', [])
+                                if exec_legs:
+                                    total_price = 0
+                                    total_quantity = 0
+                                    for exec_leg in exec_legs:
+                                        if 'price' in exec_leg and 'quantity' in exec_leg:
+                                            total_price += exec_leg['price'] * exec_leg['quantity']
+                                            total_quantity += exec_leg['quantity']
+                                    if total_quantity > 0:
+                                        exit_price = total_price / total_quantity
+                                        logger.debug(f"Got exit price from orderActivityCollection for {ticker}: ${exit_price:.2f}")
+                                        break
+                    
+                    # Method 2: Try top-level averageFillPrice
+                    if exit_price is None and 'averageFillPrice' in order_status:
                         exit_price = float(order_status['averageFillPrice'])
                         logger.debug(f"Got exit price from top-level averageFillPrice for {ticker}: ${exit_price:.2f}")
-                    # Try orderLegCollection (for stop loss orders, fill price is often here)
-                    elif 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
+                    
+                    # Method 3: Try orderLegCollection (for stop loss orders, fill price is often here)
+                    if exit_price is None and 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
                         leg = order_status['orderLegCollection'][0]
                         # Check executionDetails first (most accurate for filled orders)
                         if 'executionDetails' in leg and leg['executionDetails']:
@@ -143,14 +161,26 @@ class RollingStrategy:
                             elif 'price' in leg:
                                 exit_price = float(leg['price'])
                                 logger.debug(f"Got exit price from orderLegCollection price for {ticker}: ${exit_price:.2f}")
-                    # Try top-level price
-                    elif 'price' in order_status:
-                        exit_price = float(order_status['price'])
-                        logger.debug(f"Got exit price from top-level price for {ticker}: ${exit_price:.2f}")
-                    else:
-                        # Log available fields for debugging
+                    
+                    # Method 4: Try other top-level fields
+                    if exit_price is None:
+                        if 'filledPrice' in order_status:
+                            exit_price = float(order_status['filledPrice'])
+                            logger.debug(f"Got exit price from top-level filledPrice for {ticker}: ${exit_price:.2f}")
+                        elif 'averagePrice' in order_status:
+                            exit_price = float(order_status['averagePrice'])
+                            logger.debug(f"Got exit price from top-level averagePrice for {ticker}: ${exit_price:.2f}")
+                        elif 'price' in order_status and order_status.get('status', '').upper() == 'FILLED':
+                            exit_price = float(order_status['price'])
+                            logger.debug(f"Got exit price from top-level price for {ticker}: ${exit_price:.2f}")
+                    
+                    # If still no exit price, log available fields for debugging
+                    if exit_price is None:
                         available_fields = list(order_status.keys())
                         logger.warning(f"⚠️  Order status for {order_id} ({ticker}) does not contain fill price fields. Available fields: {available_fields}")
+                        # Check if orderActivityCollection exists but is empty
+                        if 'orderActivityCollection' in order_status:
+                            logger.warning(f"   orderActivityCollection exists: {order_status['orderActivityCollection']}")
                         # Check if orderLegCollection exists but is empty
                         if 'orderLegCollection' in order_status:
                             logger.warning(f"   orderLegCollection exists but is empty or doesn't have fill price")
@@ -197,14 +227,19 @@ class RollingStrategy:
                     exit_price = 0.0
                     logger.error(f"❌ CRITICAL: Could not get exit price for {ticker} - using 0.0 as fallback. Trade will be marked as closed but P&L may be incorrect.")
                 
-                self.db_manager.update_trade_on_close(
+                update_success = self.db_manager.update_trade_on_close(
                     ticker,
                     exit_price,
                     datetime.now(pytz.UTC)
                 )
-                logger.info(f"✓ Updated trade {ticker} in database (exit price: ${exit_price:.2f})")
+                if update_success:
+                    logger.info(f"✓ Updated trade {ticker} in database (exit price: ${exit_price:.2f})")
+                else:
+                    logger.error(f"❌ CRITICAL: Failed to update trade {ticker} in database - update_trade_on_close returned False")
+                    logger.error(f"   This usually means the trade was never inserted into the database when opened.")
+                    logger.error(f"   Position exists in account but has no database record.")
             except Exception as e:
-                logger.error(f"❌ CRITICAL: Could not update trade in database for {ticker}: {e}")
+                logger.error(f"❌ CRITICAL: Exception while updating trade in database for {ticker}: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
         else:
@@ -212,6 +247,183 @@ class RollingStrategy:
         
         # Remove from tracker
         self.trade_tracker.remove_trade(ticker)
+    
+    def _update_trailing_stop_losses(self) -> int:
+        """
+        Update stop losses for positions that are up 1% or more from entry.
+        Moves stop loss to lock in gains by placing it at current price - stop loss percent.
+        
+        Returns:
+            int: Number of stop losses that were updated
+        """
+        if not self.order_manager or not self.account_client or not self.market_data_client:
+            return 0
+        
+        if not self.db_manager or not self.db_manager.is_available():
+            return 0
+        
+        updated_count = 0
+        TRAILING_STOP_TRIGGER_PERCENT = 1.0  # Trigger when position is up 1%
+        
+        try:
+            from constants.parameters import STOP_LOSS_PERCENT
+            
+            # Get all current positions
+            positions = self.account_client.get_positions()
+            if not positions:
+                return 0
+            
+            logger.debug(f"Checking {len(positions)} positions for trailing stop loss updates...")
+            
+            for pos in positions:
+                try:
+                    instrument = pos.get('instrument', {})
+                    ticker = instrument.get('symbol', '').upper()
+                    if not ticker:
+                        continue
+                    
+                    # Get position details
+                    long_qty = float(pos.get('longQuantity', 0))
+                    short_qty = float(pos.get('shortQuantity', 0))
+                    
+                    if long_qty <= 0 and short_qty <= 0:
+                        continue
+                    
+                    # Determine direction and quantity
+                    if long_qty > 0:
+                        direction = 'LONG'
+                        quantity = int(long_qty)
+                        stop_instruction = 'SELL'
+                    else:
+                        direction = 'SHORT'
+                        quantity = int(short_qty)
+                        stop_instruction = 'BUY_TO_COVER'
+                    
+                    # Get entry price from database
+                    cursor = self.db_manager.connection.cursor()
+                    find_query = """
+                        SELECT entry_price, action 
+                        FROM trades 
+                        WHERE ticker = %s AND is_closed = FALSE 
+                        ORDER BY time_placed DESC 
+                        LIMIT 1
+                    """
+                    cursor.execute(find_query, (ticker,))
+                    trade = cursor.fetchone()
+                    cursor.close()
+                    
+                    if not trade or not trade[0]:
+                        logger.debug(f"No open trade found in database for {ticker}")
+                        continue
+                    
+                    entry_price = float(trade[0])
+                    db_action = trade[1].upper() if trade[1] else direction
+                    
+                    # Verify direction matches (safety check)
+                    if db_action != direction:
+                        logger.debug(f"Direction mismatch for {ticker}: DB={db_action}, Position={direction}")
+                        continue
+                    
+                    # Get current price
+                    quote_data = self.market_data_client.get_quote_full(ticker)
+                    if not quote_data:
+                        logger.debug(f"Could not get quote for {ticker}")
+                        continue
+                    
+                    current_price = (
+                        quote_data.get('quote', {}).get('lastPrice') or
+                        quote_data.get('regular', {}).get('regularMarketLastPrice') or
+                        quote_data.get('lastPrice')
+                    )
+                    
+                    if not current_price:
+                        logger.debug(f"Could not get current price for {ticker}")
+                        continue
+                    
+                    current_price = float(current_price)
+                    
+                    # Calculate gain percentage
+                    if direction == 'LONG':
+                        gain_percent = ((current_price - entry_price) / entry_price) * 100
+                    else:  # SHORT
+                        gain_percent = ((entry_price - current_price) / entry_price) * 100
+                    
+                    # Check if position is up 1% or more
+                    if gain_percent < TRAILING_STOP_TRIGGER_PERCENT:
+                        continue  # Not up enough yet
+                    
+                    # Get existing stop loss order ID
+                    existing_stop_loss_id = self.trade_tracker.get_stop_loss_order_id(ticker)
+                    
+                    if not existing_stop_loss_id:
+                        logger.debug(f"No stop loss order tracked for {ticker}, skipping trailing stop update")
+                        continue
+                    
+                    # Calculate new stop loss price based on current price
+                    # New stop = current price - stop loss percent (to lock in gains)
+                    if direction == 'LONG':
+                        # For LONG: stop loss is below current price
+                        new_stop_price = current_price * (1 - STOP_LOSS_PERCENT / 100)
+                        # Ensure we don't go below entry price (lock in at least break-even)
+                        if new_stop_price < entry_price:
+                            new_stop_price = entry_price
+                    else:  # SHORT
+                        # For SHORT: stop loss is above current price
+                        new_stop_price = current_price * (1 + STOP_LOSS_PERCENT / 100)
+                        # Ensure we don't go above entry price (lock in at least break-even)
+                        if new_stop_price > entry_price:
+                            new_stop_price = entry_price
+                    
+                    logger.info(f"🔼 {ticker} is up {gain_percent:.2f}% (Entry: ${entry_price:.2f}, Current: ${current_price:.2f})")
+                    logger.info(f"   Updating stop loss from entry-based to current-price-based: ${new_stop_price:.2f}")
+                    
+                    # Cancel existing stop loss order
+                    cancel_result = self.order_manager.cancel_order(existing_stop_loss_id)
+                    if not cancel_result.get('success'):
+                        # Check if order was already filled or doesn't exist
+                        error_msg = cancel_result.get('error', '').upper()
+                        if 'FILLED' in error_msg or 'NOT FOUND' in error_msg or '404' in error_msg:
+                            logger.debug(f"Stop loss order for {ticker} already filled or doesn't exist, skipping update")
+                            continue
+                        else:
+                            logger.warning(f"Failed to cancel stop loss for {ticker}: {cancel_result.get('error')}")
+                            continue
+                    
+                    # Small delay to ensure cancellation is processed
+                    import time
+                    time.sleep(0.5)
+                    
+                    # Place new stop loss order at current price - stop loss percent
+                    stop_loss_result = self.order_manager.create_stop_loss_order(
+                        ticker,
+                        stop_instruction,
+                        quantity,
+                        current_price,  # Use current price as the base
+                        STOP_LOSS_PERCENT
+                    )
+                    
+                    if stop_loss_result.get('orderId') or stop_loss_result.get('success'):
+                        new_stop_loss_id = stop_loss_result.get('orderId', stop_loss_result.get('order_id', 'unknown'))
+                        self.trade_tracker.set_stop_loss_order_id(ticker, new_stop_loss_id)
+                        logger.info(f"✓ Updated trailing stop loss for {ticker} (New Order ID: {new_stop_loss_id}, Stop: ${new_stop_price:.2f})")
+                        updated_count += 1
+                    else:
+                        logger.warning(f"Failed to place new stop loss for {ticker}: {stop_loss_result.get('error', 'Unknown error')}")
+                        
+                except Exception as e:
+                    logger.debug(f"Error updating trailing stop loss for {pos.get('instrument', {}).get('symbol', 'unknown')}: {e}")
+                    continue
+            
+            if updated_count > 0:
+                logger.info(f"Updated {updated_count} trailing stop loss(es) to lock in gains")
+            
+            return updated_count
+            
+        except Exception as e:
+            logger.error(f"Error in trailing stop loss update: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return 0
     
     def _check_and_update_stop_losses(self) -> int:
         """
@@ -860,7 +1072,7 @@ class RollingStrategy:
                 # Check if limit orders filled, fall back to market if needed
                 if close_orders:
                     import time
-                    time.sleep(2)  # Wait a moment for orders to process
+                    time.sleep(0.5)  # Reduced from 2s - minimal wait for orders to process
                     
                     for close_order in close_orders:
                         order_id = close_order['order_id']
@@ -886,11 +1098,11 @@ class RollingStrategy:
                                 close_order_id = result.get('orderId', result.get('order_id'))
                                 # Wait a moment for market order to fill, then update
                                 import time
-                                time.sleep(1)
+                                time.sleep(0.5)  # Reduced from 1s
                                 self._close_trade_with_db_update(ticker, close_order_id)
                         elif status in ['WORKING', 'PENDING_ACTIVATION', 'QUEUED', 'ACCEPTED']:
                             # Still working, wait a bit more then check again
-                            time.sleep(3)
+                            time.sleep(1)  # Reduced from 3s
                             order_status = self.order_manager.get_order_status(order_id)
                             status = order_status.get('status', '').upper()
                             
@@ -910,7 +1122,7 @@ class RollingStrategy:
                                     logger.info(f"✓ Market order placed to close {ticker}")
                                     close_order_id = result.get('orderId', result.get('order_id'))
                                     # Wait a moment for market order to fill, then update
-                                    time.sleep(1)
+                                    time.sleep(0.5)  # Reduced from 1s
                                     self._close_trade_with_db_update(ticker, close_order_id)
             
             # Step 9.5: Check for stop losses that were triggered
@@ -980,16 +1192,53 @@ class RollingStrategy:
                                     entry_price = result.get('price', 0)
                                     order_id = result.get('order_id', 'unknown')
                                     
+                                    # Try to get actual fill price from order status if entry_price is 0 or missing
+                                    if (entry_price is None or entry_price <= 0) and self.order_manager:
+                                        try:
+                                            order_status = self.order_manager.get_order_status(order_id)
+                                            if 'averageFillPrice' in order_status:
+                                                entry_price = float(order_status['averageFillPrice'])
+                                                logger.debug(f"Got actual fill price for {ticker} from order status: ${entry_price:.2f}")
+                                            elif 'orderActivityCollection' in order_status and order_status['orderActivityCollection']:
+                                                # Try to get fill price from execution activities
+                                                for activity in order_status['orderActivityCollection']:
+                                                    if activity.get('activityType') == 'EXECUTION':
+                                                        exec_legs = activity.get('executionLegs', [])
+                                                        if exec_legs:
+                                                            total_price = 0
+                                                            total_quantity = 0
+                                                            for exec_leg in exec_legs:
+                                                                if 'price' in exec_leg and 'quantity' in exec_leg:
+                                                                    total_price += exec_leg['price'] * exec_leg['quantity']
+                                                                    total_quantity += exec_leg['quantity']
+                                                            if total_quantity > 0:
+                                                                entry_price = total_price / total_quantity
+                                                                logger.debug(f"Got actual fill price for {ticker} from orderActivityCollection: ${entry_price:.2f}")
+                                                                break
+                                        except Exception as e:
+                                            logger.warning(f"Could not get fill price from order status for {ticker}: {e}")
+                                    
                                     # Track the trade
                                     if ticker:
                                         self.trade_tracker.add_trade(ticker)
                                         if SHOW_ORDER_OUTPUT:
                                             logger.debug(f"Tracking new trade: {ticker} ({direction}, {shares} shares)")
                                         
-                                        # Insert trade to database
-                                        if self.db_manager and self.db_manager.is_available() and entry_price > 0:
+                                        # Insert trade to database - ALWAYS insert if database is available
+                                        if self.db_manager and self.db_manager.is_available():
                                             from datetime import datetime
                                             import pytz
+                                            
+                                            # Get PRT data for this ticker if available
+                                            prt_data_for_trade = None
+                                            if ticker in prt_data:
+                                                prt_data_for_trade = prt_data[ticker]
+                                            
+                                            # Use entry_price if available, otherwise use 0 (will be logged as error but still tracked)
+                                            if entry_price is None or entry_price <= 0:
+                                                logger.error(f"⚠️  WARNING: Entry price is {entry_price} for {ticker} - trade will be logged with price 0.0")
+                                                entry_price = 0.0
+                                            
                                             trade_data = {
                                                 'ticker': ticker,
                                                 'action': direction,
@@ -1001,11 +1250,18 @@ class RollingStrategy:
                                                 'time_placed': datetime.now(pytz.UTC),
                                                 'close_time': None,
                                                 'order_id': str(order_id),
-                                                'is_closed': False
+                                                'is_closed': False,
+                                                'prt_data': prt_data_for_trade  # Include PRT data if available
                                             }
                                             trade_db_id = self.db_manager.insert_trade(trade_data)
                                             if trade_db_id:
-                                                logger.debug(f"Trade inserted to database: {ticker} (DB ID: {trade_db_id})")
+                                                logger.info(f"✓ Trade inserted to database: {ticker} (DB ID: {trade_db_id}, Entry: ${entry_price:.2f})")
+                                                if prt_data_for_trade:
+                                                    logger.debug(f"PRT data included: edge={prt_data_for_trade.get('edge')}, prob_up={prt_data_for_trade.get('prob_up')}")
+                                            else:
+                                                logger.error(f"❌ CRITICAL: Failed to insert trade to database for {ticker} - trade will not be tracked!")
+                                        else:
+                                            logger.error(f"❌ CRITICAL: Database not available - trade {ticker} will not be logged!")
                                     
                                     # Place stop loss order
                                     if entry_price > 0:

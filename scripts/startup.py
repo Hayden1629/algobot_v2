@@ -245,16 +245,6 @@ def close_all_positions_before_market_close(
         if not symbol:
             continue
         
-        # Get exit price before closing (for database update)
-        exit_price = None
-        if db_manager and market_data_client and db_manager.is_available():
-            try:
-                quote = market_data_client.get_quote(symbol)
-                if quote:
-                    exit_price = quote.get('lastPrice') or quote.get('last')
-            except Exception as e:
-                logger.debug(f"Could not get quote for {symbol}: {e}")
-        
         order_id = None
         if long_qty > 0:
             result = order_manager.create_market_order(symbol, "SELL", int(long_qty))
@@ -272,61 +262,102 @@ def close_all_positions_before_market_close(
                 from datetime import datetime
                 import pytz
                 
+                exit_price = None
+                
                 # Try to get exit price from order if available (more accurate than quote)
+                # Wait a moment for market order to fill before checking status
                 if order_id:
-                    try:
-                        order_status = order_manager.get_order_status(order_id)
+                    import time
+                    time.sleep(1)  # Wait 1 second for market order to fill
+                    
+                    # Retry checking order status up to 3 times
+                    for attempt in range(3):
+                        try:
+                            order_status = order_manager.get_order_status(order_id)
+                            
+                            # Check for error in response
+                            if 'error' not in order_status:
+                                # Try orderActivityCollection first (most reliable for filled orders)
+                                if 'orderActivityCollection' in order_status and order_status['orderActivityCollection']:
+                                    activities = order_status['orderActivityCollection']
+                                    for activity in activities:
+                                        if 'executionLegs' in activity and activity['executionLegs']:
+                                            for leg in activity['executionLegs']:
+                                                if 'price' in leg:
+                                                    exit_price = float(leg['price'])
+                                                    logger.debug(f"Got exit price from orderActivityCollection for {symbol}: ${exit_price:.2f}")
+                                                    break
+                                            if exit_price is not None:
+                                                break
+                                
+                                # Try top-level averageFillPrice
+                                if exit_price is None and 'averageFillPrice' in order_status:
+                                    exit_price = float(order_status['averageFillPrice'])
+                                    logger.debug(f"Got exit price from top-level averageFillPrice for {symbol}: ${exit_price:.2f}")
+                                # Try orderLegCollection (for stop loss orders, fill price is often here)
+                                elif exit_price is None and 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
+                                    leg = order_status['orderLegCollection'][0]
+                                    # Check executionDetails first (most accurate for filled orders)
+                                    if 'executionDetails' in leg and leg['executionDetails']:
+                                        executions = leg['executionDetails']
+                                        if executions:
+                                            # Calculate average fill price from all executions
+                                            total_price = 0
+                                            total_quantity = 0
+                                            for execution in executions:
+                                                if 'price' in execution and 'quantity' in execution:
+                                                    total_price += execution['price'] * execution['quantity']
+                                                    total_quantity += execution['quantity']
+                                            if total_quantity > 0:
+                                                exit_price = total_price / total_quantity
+                                                logger.debug(f"Got exit price from executionDetails for {symbol}: ${exit_price:.2f}")
+                                    # Fallback to other leg fields
+                                    if exit_price is None:
+                                        if 'averageFillPrice' in leg:
+                                            exit_price = float(leg['averageFillPrice'])
+                                            logger.debug(f"Got exit price from orderLegCollection averageFillPrice for {symbol}: ${exit_price:.2f}")
+                                        elif 'averagePrice' in leg:
+                                            exit_price = float(leg['averagePrice'])
+                                            logger.debug(f"Got exit price from orderLegCollection averagePrice for {symbol}: ${exit_price:.2f}")
+                                        elif 'filledPrice' in leg:
+                                            exit_price = float(leg['filledPrice'])
+                                            logger.debug(f"Got exit price from orderLegCollection filledPrice for {symbol}: ${exit_price:.2f}")
+                                        elif 'price' in leg:
+                                            exit_price = float(leg['price'])
+                                            logger.debug(f"Got exit price from orderLegCollection price for {symbol}: ${exit_price:.2f}")
+                                # Try top-level price
+                                elif 'price' in order_status:
+                                    exit_price = float(order_status['price'])
+                                    logger.debug(f"Got exit price from top-level price for {symbol}: ${exit_price:.2f}")
+                                
+                                # If we got a price, break out of retry loop
+                                if exit_price is not None:
+                                    break
+                                
+                                # If order is filled but we didn't get price, break (will try other methods)
+                                status = order_status.get('status', '').upper()
+                                if status == 'FILLED':
+                                    break
+                                
+                        except Exception as e:
+                            logger.debug(f"Could not get exit price from order {order_id} for {symbol} (attempt {attempt + 1}): {e}")
                         
-                        # Check for error in response
-                        if 'error' not in order_status:
-                            # Try top-level averageFillPrice first
-                            if 'averageFillPrice' in order_status:
-                                exit_price = float(order_status['averageFillPrice'])
-                                logger.debug(f"Got exit price from top-level averageFillPrice for {symbol}: ${exit_price:.2f}")
-                            # Try orderLegCollection (for stop loss orders, fill price is often here)
-                            elif 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
-                                leg = order_status['orderLegCollection'][0]
-                                # Check executionDetails first (most accurate for filled orders)
-                                if 'executionDetails' in leg and leg['executionDetails']:
-                                    executions = leg['executionDetails']
-                                    if executions:
-                                        # Calculate average fill price from all executions
-                                        total_price = 0
-                                        total_quantity = 0
-                                        for execution in executions:
-                                            if 'price' in execution and 'quantity' in execution:
-                                                total_price += execution['price'] * execution['quantity']
-                                                total_quantity += execution['quantity']
-                                        if total_quantity > 0:
-                                            exit_price = total_price / total_quantity
-                                            logger.debug(f"Got exit price from executionDetails for {symbol}: ${exit_price:.2f}")
-                                # Fallback to other leg fields
-                                if exit_price is None:
-                                    if 'averageFillPrice' in leg:
-                                        exit_price = float(leg['averageFillPrice'])
-                                        logger.debug(f"Got exit price from orderLegCollection averageFillPrice for {symbol}: ${exit_price:.2f}")
-                                    elif 'averagePrice' in leg:
-                                        exit_price = float(leg['averagePrice'])
-                                        logger.debug(f"Got exit price from orderLegCollection averagePrice for {symbol}: ${exit_price:.2f}")
-                                    elif 'filledPrice' in leg:
-                                        exit_price = float(leg['filledPrice'])
-                                        logger.debug(f"Got exit price from orderLegCollection filledPrice for {symbol}: ${exit_price:.2f}")
-                                    elif 'price' in leg:
-                                        exit_price = float(leg['price'])
-                                        logger.debug(f"Got exit price from orderLegCollection price for {symbol}: ${exit_price:.2f}")
-                            # Try top-level price
-                            elif 'price' in order_status:
-                                exit_price = float(order_status['price'])
-                                logger.debug(f"Got exit price from top-level price for {symbol}: ${exit_price:.2f}")
-                    except Exception as e:
-                        logger.debug(f"Could not get exit price from order {order_id} for {symbol}: {e}")
+                        # Wait before retrying (except on last attempt)
+                        if attempt < 2 and exit_price is None:
+                            time.sleep(0.5)
+                    
+                    # If still no price after retries, log it
+                    if exit_price is None:
+                        logger.debug(f"Could not get exit price from order {order_id} for {symbol} after retries")
                 
                 # Fallback: get current quote if we still don't have exit price
                 if exit_price is None and market_data_client:
                     try:
-                        quote = market_data_client.get_quote(symbol)
-                        if quote:
-                            exit_price = quote.get('lastPrice') or quote.get('last')
+                        # get_quote returns a float directly, not a dict
+                        quote_price = market_data_client.get_quote(symbol)
+                        if quote_price:
+                            exit_price = float(quote_price)
+                            logger.debug(f"Got exit price from quote for {symbol}: ${exit_price:.2f}")
                     except Exception as e:
                         logger.debug(f"Could not get quote for {symbol}: {e}")
                 
@@ -877,6 +908,16 @@ def trading_loop(
                         db_manager=db_mgr, market_data_client=market_data_client
                     )
                     break
+                
+                # Check and update trailing stop losses periodically during wait
+                # Update stop losses for positions that are up 1%+ to lock in gains
+                if strategy and hasattr(strategy, '_update_trailing_stop_losses'):
+                    try:
+                        updated = strategy._update_trailing_stop_losses()
+                        if updated > 0:
+                            logger.info(f"Trailing stop losses updated: {updated} position(s)")
+                    except Exception as e:
+                        logger.debug(f"Error updating trailing stop losses: {e}")
                 
                 # Check and log account size periodically during wait
                 now = datetime.now()

@@ -108,7 +108,17 @@ def retrieve_tokens(headers: Dict[str, str], payload: Dict[str, str]) -> Dict:
     )
     
     if response.status_code != 200:
-        logger.error(f"Token acquisition failed: {response.status_code} - {response.text}")
+        error_text = response.text
+        logger.error(f"Token acquisition failed: {response.status_code} - {error_text}")
+        
+        # Check if authorization code expired
+        if "expired" in error_text.lower() or "AuthorizationCode has expired" in error_text:
+            logger.error("=" * 60)
+            logger.error("❌ Authorization code expired!")
+            logger.error("The code expires in ~30 seconds. You need to paste the URL immediately after authorization.")
+            logger.error("Please try again and paste the URL as soon as you see it in the browser.")
+            logger.error("=" * 60)
+        
         response.raise_for_status()
     
     return response.json()
@@ -126,11 +136,17 @@ def acquire_tokens() -> Optional[Dict]:
     
     app_key, app_secret, auth_url = construct_auth_url()
     
+    logger.warning("=" * 60)
+    logger.warning("⚠️  IMPORTANT: Authorization codes expire in ~30 seconds!")
+    logger.warning("⚠️  Have the browser ready and paste the URL IMMEDIATELY after authorization.")
+    logger.warning("=" * 60)
+    logger.info("Opening browser for authorization...")
+    
     # Open browser for user authorization
     webbrowser.open(auth_url)
     
     logger.info("Please complete authorization in the browser.")
-    logger.info("After authorization, paste the returned URL here:")
+    logger.warning("⚠️  URGENT: Paste the returned URL NOW (codes expire quickly!):")
     returned_url = input().strip()
     
     if not returned_url:

@@ -294,7 +294,7 @@ class TradeExecutor:
             if SHOW_ORDER_OUTPUT:
                 logger.info(f"Checking {len(pending_orders)} order(s) for fills...")
             import time
-            time.sleep(2)  # Wait a moment for orders to process
+            time.sleep(0.5)  # Reduced from 2s - minimal wait for orders to process
             
             # Quick initial check - some orders may fill immediately
             filled_immediately = []
@@ -315,8 +315,8 @@ class TradeExecutor:
             for filled in filled_immediately:
                 pending_orders.remove(filled)
             
-            max_retries = 3
-            retry_delay = 3  # seconds
+            max_retries = 2  # Reduced from 3
+            retry_delay = 1  # Reduced from 3 seconds
             
             for attempt in range(max_retries):
                 still_pending = []

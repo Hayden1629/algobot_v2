@@ -150,6 +150,15 @@ class DatabaseManager:
                 - time_placed: Entry time (datetime)
                 - close_time: Close time (datetime, optional)
                 - order_id: Order ID
+                - prt_data: Optional PRT data dictionary with keys:
+                    - edge: Expected edge
+                    - prob_up: Probability of upward movement
+                    - mean: Mean return
+                    - p10: 10th percentile
+                    - p90: 90th percentile
+                    - dist1: Distribution parameter
+                    - n: Sample size
+                    - timestamp: PRT analysis timestamp
         
         Returns:
             int: Trade ID if successful, None otherwise
@@ -213,13 +222,59 @@ class DatabaseManager:
             cursor.execute(trade_insert, trade_values)
             trade_id = cursor.lastrowid
             
+            # Insert PRT data if provided
+            prt_data = trade_data.get('prt_data')
+            if prt_data and trade_id:
+                try:
+                    prt_insert = """
+                        INSERT INTO prt_data (
+                            trade_id, edge, prob_up, mean, p10, p90, dist1, n, timestamp
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE
+                            edge = VALUES(edge),
+                            prob_up = VALUES(prob_up),
+                            mean = VALUES(mean),
+                            p10 = VALUES(p10),
+                            p90 = VALUES(p90),
+                            dist1 = VALUES(dist1),
+                            n = VALUES(n),
+                            timestamp = VALUES(timestamp)
+                    """
+                    prt_values = (
+                        trade_id,
+                        prt_data.get('edge'),
+                        prt_data.get('prob_up'),
+                        prt_data.get('mean'),
+                        prt_data.get('p10'),
+                        prt_data.get('p90'),
+                        prt_data.get('dist1'),
+                        prt_data.get('n'),
+                        prt_data.get('timestamp')
+                    )
+                    cursor.execute(prt_insert, prt_values)
+                    logger.debug(f"PRT data inserted for trade ID {trade_id}")
+                except Error as e:
+                    logger.warning(f"Error inserting PRT data for trade {trade_id}: {e}")
+                    # Don't fail the trade insertion if PRT data fails
+            
             self.connection.commit()
             cursor.close()
             logger.debug(f"Trade inserted successfully: ID {trade_id}, Ticker {trade_data.get('ticker')}")
             return trade_id
             
         except Error as e:
-            logger.error(f"Error inserting trade: {e}")
+            logger.error(f"❌ CRITICAL: Error inserting trade to database: {e}")
+            logger.error(f"   Trade data: ticker={trade_data.get('ticker')}, action={trade_data.get('action')}, quantity={trade_data.get('quantity')}, entry_price={trade_data.get('entry_price')}")
+            try:
+                self.connection.rollback()
+            except:
+                pass
+            return None
+        except Exception as e:
+            logger.error(f"❌ CRITICAL: Unexpected error inserting trade to database: {e}")
+            logger.error(f"   Trade data: ticker={trade_data.get('ticker')}, action={trade_data.get('action')}, quantity={trade_data.get('quantity')}, entry_price={trade_data.get('entry_price')}")
+            import traceback
+            logger.error(traceback.format_exc())
             try:
                 self.connection.rollback()
             except:
@@ -259,9 +314,23 @@ class DatabaseManager:
             trade = cursor.fetchone()
             
             if not trade:
-                logger.debug(f"Could not find open trade for ticker {ticker}")
-                cursor.close()
-                return False
+                # Check if there's a closed trade - might be trying to close twice
+                check_closed_query = "SELECT id, entry_price, time_placed FROM trades WHERE ticker = %s ORDER BY time_placed DESC LIMIT 1"
+                cursor.execute(check_closed_query, (ticker.upper(),))
+                closed_trade = cursor.fetchone()
+                
+                if closed_trade:
+                    # Trade exists but is already closed
+                    logger.warning(f"⚠️  Trade for {ticker} is already closed in database (ID: {closed_trade[0]}) - skipping duplicate close")
+                    cursor.close()
+                    return True  # Return True since trade is already closed
+                else:
+                    # No trade exists at all - this is a critical error
+                    logger.error(f"❌ CRITICAL: Could not find ANY trade for ticker {ticker} in database - trade was never logged!")
+                    logger.error(f"   This means the trade was opened but never inserted into the database.")
+                    logger.error(f"   Position may have been opened outside the system or database insert failed.")
+                    cursor.close()
+                    return False
             
             trade_id, entry_price, time_placed = trade
             

@@ -511,6 +511,53 @@ class PositionSizer:
         new_long_exposure = 0.0
         new_short_exposure = 0.0
         
+        # Batch fetch all prices at once (much faster than sequential calls)
+        all_tickers = [c.get('ticker', '').upper() for c in trade_candidates if c.get('ticker')]
+        logger.debug(f"Fetching prices for {len(all_tickers)} tickers in batch...")
+        batch_quotes = self.market_data_client.get_quotes_batch(all_tickers)
+        
+        # Extract prices from batch quotes
+        ticker_prices = {}
+        for ticker in all_tickers:
+            quote_data = batch_quotes.get(ticker)
+            if quote_data:
+                # Extract price using same logic as get_current_price
+                quote_field = quote_data.get('quote', {})
+                if isinstance(quote_field, dict):
+                    price = (
+                        quote_field.get('lastPrice') or
+                        quote_field.get('regularMarketLastPrice') or
+                        quote_field.get('closePrice') or
+                        quote_field.get('bidPrice') or
+                        quote_field.get('askPrice')
+                    )
+                    if price is not None:
+                        ticker_prices[ticker] = float(price)
+                        continue
+                
+                regular_field = quote_data.get('regular', {})
+                if isinstance(regular_field, dict):
+                    price = regular_field.get('regularMarketLastPrice')
+                    if price is not None:
+                        ticker_prices[ticker] = float(price)
+                        continue
+                
+                price = (
+                    quote_data.get('lastPrice') or
+                    quote_data.get('regularMarketLastPrice') or
+                    quote_data.get('last') or
+                    quote_data.get('closePrice') or
+                    quote_data.get('regularMarketPrice') or
+                    quote_data.get('bidPrice') or
+                    quote_data.get('bid') or
+                    quote_data.get('askPrice') or
+                    quote_data.get('ask')
+                )
+                if price is not None:
+                    ticker_prices[ticker] = float(price)
+        
+        logger.debug(f"Successfully retrieved prices for {len(ticker_prices)}/{len(all_tickers)} tickers")
+        
         # Process ALL candidates (not filtered) with adjusted sizing
         for candidate in trade_candidates:
             ticker = candidate.get('ticker', '').upper()
@@ -524,8 +571,8 @@ class PositionSizer:
                 logger.warning(f"Invalid direction '{direction}' for {ticker}, skipping")
                 continue
             
-            # Get current price
-            price = self.get_current_price(ticker)
+            # Get current price from batch results
+            price = ticker_prices.get(ticker)
             if price is None:
                 logger.warning(f"Could not get price for {ticker}, skipping")
                 continue
