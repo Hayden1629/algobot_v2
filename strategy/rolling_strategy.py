@@ -315,6 +315,199 @@ class RollingStrategy:
         
         return triggered_count
     
+    def _update_trailing_stop_losses(self) -> int:
+        """
+        Update stop losses for positions that are up 1% or more from entry.
+        Moves stop loss to lock in gains by placing it at current price - stop loss percent.
+        Only updates again if price has moved up another 1% from the last update price.
+        
+        Returns:
+            int: Number of stop losses that were updated
+        """
+        if not self.order_manager or not self.account_client or not self.market_data_client:
+            return 0
+        
+        if not self.db_manager or not self.db_manager.is_available():
+            return 0
+        
+        updated_count = 0
+        TRAILING_STOP_TRIGGER_PERCENT = 1.0  # Trigger when position is up 1%
+        
+        try:
+            from constants.parameters import STOP_LOSS_PERCENT
+            
+            # Get all current positions
+            positions = self.account_client.get_positions()
+            if not positions:
+                return 0
+            
+            logger.debug(f"Checking {len(positions)} positions for trailing stop loss updates...")
+            
+            for pos in positions:
+                try:
+                    instrument = pos.get('instrument', {})
+                    ticker = instrument.get('symbol', '').upper()
+                    if not ticker:
+                        continue
+                    
+                    # Get position details
+                    long_qty = float(pos.get('longQuantity', 0))
+                    short_qty = float(pos.get('shortQuantity', 0))
+                    
+                    if long_qty <= 0 and short_qty <= 0:
+                        continue
+                    
+                    # Determine direction and quantity
+                    if long_qty > 0:
+                        direction = 'LONG'
+                        quantity = int(long_qty)
+                        stop_instruction = 'SELL'
+                    else:
+                        direction = 'SHORT'
+                        quantity = int(short_qty)
+                        stop_instruction = 'BUY_TO_COVER'
+                    
+                    # Get entry price from database
+                    cursor = self.db_manager.connection.cursor()
+                    find_query = """
+                        SELECT entry_price, action 
+                        FROM trades 
+                        WHERE ticker = %s AND is_closed = FALSE 
+                        ORDER BY time_placed DESC 
+                        LIMIT 1
+                    """
+                    cursor.execute(find_query, (ticker,))
+                    trade = cursor.fetchone()
+                    cursor.close()
+                    
+                    if not trade or not trade[0]:
+                        # Trade not in database - this is a data integrity issue but not critical for trailing stops
+                        # Skip silently to reduce log noise (this happens when trades aren't logged on open)
+                        continue
+                    
+                    entry_price = float(trade[0])
+                    db_action = trade[1].upper() if trade[1] else direction
+                    
+                    # Verify direction matches (safety check)
+                    if db_action != direction:
+                        logger.debug(f"Direction mismatch for {ticker}: DB={db_action}, Position={direction}")
+                        continue
+                    
+                    # Get current price
+                    quote_data = self.market_data_client.get_quote_full(ticker)
+                    if not quote_data:
+                        logger.debug(f"Could not get quote for {ticker}")
+                        continue
+                    
+                    current_price = (
+                        quote_data.get('quote', {}).get('lastPrice') or
+                        quote_data.get('regular', {}).get('regularMarketLastPrice') or
+                        quote_data.get('lastPrice')
+                    )
+                    
+                    if not current_price:
+                        logger.debug(f"Could not get current price for {ticker}")
+                        continue
+                    
+                    current_price = float(current_price)
+                    
+                    # Get the last price at which trailing stop was updated (if any)
+                    last_update_price = self.trade_tracker.get_last_trailing_stop_price(ticker)
+                    
+                    # Determine the reference price for calculating gain
+                    # If we've updated before, use last update price; otherwise use entry price
+                    if last_update_price is not None:
+                        reference_price = last_update_price
+                        logger.debug(f"{ticker}: Using last update price ${reference_price:.2f} as reference")
+                    else:
+                        reference_price = entry_price
+                        logger.debug(f"{ticker}: Using entry price ${reference_price:.2f} as reference (first trailing stop check)")
+                    
+                    # Calculate gain percentage from reference price
+                    if direction == 'LONG':
+                        gain_percent = ((current_price - reference_price) / reference_price) * 100
+                    else:  # SHORT
+                        gain_percent = ((reference_price - current_price) / reference_price) * 100
+                    
+                    # Only update if position is up 1% or more from reference price
+                    if gain_percent < TRAILING_STOP_TRIGGER_PERCENT:
+                        continue  # Not up enough yet
+                    
+                    # Get existing stop loss order ID
+                    existing_stop_loss_id = self.trade_tracker.get_stop_loss_order_id(ticker)
+                    
+                    if not existing_stop_loss_id:
+                        logger.debug(f"No stop loss order tracked for {ticker}, skipping trailing stop update")
+                        continue
+                    
+                    # Calculate new stop loss price based on current price
+                    # New stop = current price - stop loss percent (to lock in gains)
+                    if direction == 'LONG':
+                        # For LONG: stop loss is below current price
+                        new_stop_price = current_price * (1 - STOP_LOSS_PERCENT / 100)
+                        # Ensure we don't go below entry price (lock in at least break-even)
+                        if new_stop_price < entry_price:
+                            new_stop_price = entry_price
+                    else:  # SHORT
+                        # For SHORT: stop loss is above current price
+                        new_stop_price = current_price * (1 + STOP_LOSS_PERCENT / 100)
+                        # Ensure we don't go above entry price (lock in at least break-even)
+                        if new_stop_price > entry_price:
+                            new_stop_price = entry_price
+                    
+                    logger.info(f"🔼 {ticker} is up {gain_percent:.2f}% from {'last update' if last_update_price else 'entry'} (Ref: ${reference_price:.2f}, Current: ${current_price:.2f})")
+                    logger.info(f"   Updating stop loss from entry-based to current-price-based: ${new_stop_price:.2f}")
+                    
+                    # Cancel existing stop loss order
+                    cancel_result = self.order_manager.cancel_order(existing_stop_loss_id)
+                    if not cancel_result.get('success'):
+                        # Check if order was already filled or doesn't exist
+                        error_msg = cancel_result.get('error', '').upper()
+                        if 'FILLED' in error_msg or 'NOT FOUND' in error_msg or '404' in error_msg:
+                            logger.debug(f"Stop loss order for {ticker} already filled or doesn't exist, skipping update")
+                            continue
+                        else:
+                            logger.warning(f"Failed to cancel stop loss for {ticker}: {cancel_result.get('error')}")
+                            continue
+                    
+                    # Small delay to ensure cancellation is processed
+                    import time
+                    time.sleep(0.5)
+                    
+                    # Place new stop loss order at current price - stop loss percent
+                    stop_loss_result = self.order_manager.create_stop_loss_order(
+                        ticker,
+                        stop_instruction,
+                        quantity,
+                        current_price,  # Use current price as the base
+                        STOP_LOSS_PERCENT
+                    )
+                    
+                    if stop_loss_result.get('orderId') or stop_loss_result.get('success'):
+                        new_stop_loss_id = stop_loss_result.get('orderId', stop_loss_result.get('order_id', 'unknown'))
+                        self.trade_tracker.set_stop_loss_order_id(ticker, new_stop_loss_id)
+                        # Track the current price as the last update price
+                        self.trade_tracker.set_last_trailing_stop_price(ticker, current_price)
+                        logger.info(f"✓ Updated trailing stop loss for {ticker} (New Order ID: {new_stop_loss_id}, Stop: ${new_stop_price:.2f})")
+                        updated_count += 1
+                    else:
+                        logger.warning(f"Failed to place new stop loss for {ticker}: {stop_loss_result.get('error', 'Unknown error')}")
+                        
+                except Exception as e:
+                    logger.debug(f"Error updating trailing stop loss for {pos.get('instrument', {}).get('symbol', 'unknown')}: {e}")
+                    continue
+            
+            if updated_count > 0:
+                logger.info(f"Updated {updated_count} trailing stop loss(es) to lock in gains")
+            
+            return updated_count
+            
+        except Exception as e:
+            logger.error(f"Error in trailing stop loss update: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return 0
+    
     def get_tickers_from_most(self) -> List[str]:
         """
         Get tickers from MOST command.

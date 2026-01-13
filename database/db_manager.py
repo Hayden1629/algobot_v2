@@ -259,7 +259,7 @@ class DatabaseManager:
             trade = cursor.fetchone()
             
             if not trade:
-                logger.debug(f"Could not find open trade for ticker {ticker}")
+                logger.warning(f"⚠️  Could not find open trade for ticker {ticker} - trade may have been closed already or never logged")
                 cursor.close()
                 return False
             

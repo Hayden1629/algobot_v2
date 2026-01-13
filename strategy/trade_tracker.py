@@ -46,7 +46,8 @@ class TradeTracker:
             'trade_id': trade_id,
             'entry_time': entry_time,
             'age_minutes': 0.0,
-            'stop_loss_order_id': None  # Track stop loss order ID
+            'stop_loss_order_id': None,  # Track stop loss order ID
+            'last_trailing_stop_price': None  # Track last price at which trailing stop was updated
         }
         if SHOW_ORDER_OUTPUT:
             logger.debug(f"Added trade to tracker: {ticker} at {entry_time}")
@@ -140,6 +141,35 @@ class TradeTracker:
         ticker_upper = ticker.upper()
         if ticker_upper in self.trades:
             return self.trades[ticker_upper].get('stop_loss_order_id')
+        return None
+    
+    def set_last_trailing_stop_price(self, ticker: str, price: float) -> None:
+        """
+        Set the last price at which trailing stop loss was updated.
+        
+        Args:
+            ticker: Stock ticker symbol
+            price: Price at which trailing stop was last updated
+        """
+        ticker_upper = ticker.upper()
+        if ticker_upper in self.trades:
+            self.trades[ticker_upper]['last_trailing_stop_price'] = price
+            if SHOW_ORDER_OUTPUT:
+                logger.debug(f"Set last trailing stop price for {ticker}: ${price:.2f}")
+    
+    def get_last_trailing_stop_price(self, ticker: str) -> Optional[float]:
+        """
+        Get the last price at which trailing stop loss was updated.
+        
+        Args:
+            ticker: Stock ticker symbol
+        
+        Returns:
+            float: Last trailing stop update price, or None if not found
+        """
+        ticker_upper = ticker.upper()
+        if ticker_upper in self.trades:
+            return self.trades[ticker_upper].get('last_trailing_stop_price')
         return None
     
     def clear(self) -> None:

@@ -140,8 +140,11 @@ def close_all_positions_before_market_close(
     """
     Close all positions before market close (emergency use).
     Follows RULES.md: Must close positions within 5 minutes of market close.
-    Cancels all outstanding orders (including stop losses) before closing positions.
-    Updates trades in database with exit prices and profit/loss if db_manager is provided.
+    
+    Process:
+    1. Cancel ALL outstanding orders FIRST (including stop losses)
+    2. Submit ALL market orders to close positions (fast, no database work)
+    3. Update database AFTER all orders are submitted
     
     Args:
         order_manager: Order manager instance
@@ -154,8 +157,9 @@ def close_all_positions_before_market_close(
     logger.error(f"EMERGENCY: Closing all positions - {reason}")
     logger.error("=" * 60)
     
-    # CRITICAL STEP 1: Cancel ALL outstanding orders FIRST (including stop losses)
-    # This MUST happen before attempting to close positions
+    # ========================================================================
+    # STEP 1: CANCEL ALL OUTSTANDING ORDERS FIRST
+    # ========================================================================
     logger.error("STEP 1: CANCELING ALL OUTSTANDING ORDERS (INCLUDING STOP LOSSES)")
     logger.error("=" * 60)
     
@@ -167,25 +171,20 @@ def close_all_positions_before_market_close(
         open_orders = account_client.get_all_open_orders()
         logger.error(f"API returned: {len(open_orders) if open_orders else 0} order(s)")
         
-        if not open_orders:
-            logger.error("WARNING: get_all_open_orders() returned empty list - this may be incorrect!")
-            logger.error("Attempting to proceed with position closure anyway...")
-        elif len(open_orders) > 0:
+        if open_orders and len(open_orders) > 0:
             logger.error(f"FOUND {len(open_orders)} OUTSTANDING ORDER(S) - CANCELING ALL NOW")
-            
             for idx, order in enumerate(open_orders, 1):
                 order_id = order.get('orderId') or order.get('order_id')
                 order_status = order.get('status', 'UNKNOWN')
                 symbol = order.get('orderLegCollection', [{}])[0].get('instrument', {}).get('symbol', 'UNKNOWN')
                 
-                logger.error(f"[{idx}/{len(open_orders)}] CANCELING: Order {order_id} for {symbol} (status: {order_status})")
-                
                 if not order_id:
-                    logger.error(f"  ✗ SKIPPED: Order missing orderId - {order}")
+                    logger.error(f"[{idx}/{len(open_orders)}] ✗ SKIPPED: Missing orderId for {symbol}")
                     failed_count += 1
                     continue
                 
                 try:
+                    logger.error(f"[{idx}/{len(open_orders)}] CANCELING: Order {order_id} for {symbol} (status: {order_status})")
                     cancel_result = order_manager.cancel_order(str(order_id))
                     if cancel_result and cancel_result.get('success'):
                         canceled_count += 1
@@ -195,173 +194,195 @@ def close_all_positions_before_market_close(
                         error_upper = str(error).upper()
                         
                         if any(term in error_upper for term in ['FILLED', 'NOT FOUND', '404', 'CANNOT BE CANCELED', 'ALREADY EXECUTED', 'ALREADY FILLED']):
-                            logger.error(f"  → Order {order_id} already filled/executed (OK to skip)")
+                            logger.error(f"  → Order already filled/executed (OK)")
                         else:
                             failed_count += 1
-                            logger.error(f"  ✗ FAILED: Could not cancel order {order_id}: {error}")
+                            logger.error(f"  ✗ FAILED: {error}")
                 except Exception as e:
                     failed_count += 1
-                    logger.error(f"  ✗ EXCEPTION canceling order {order_id}: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
+                    logger.error(f"  ✗ EXCEPTION: {e}")
             
             logger.error(f"ORDER CANCELLATION SUMMARY: {canceled_count} canceled, {failed_count} failed")
             
-            # CRITICAL: Wait to ensure cancellations are processed
+            # Brief wait to ensure cancellations are processed
             if canceled_count > 0:
-                logger.error(f"Waiting 3 seconds for {canceled_count} cancellation(s) to process...")
-                time.sleep(3)
-            elif len(open_orders) > 0:
-                logger.error("No orders were successfully canceled - waiting 2 seconds anyway...")
-                time.sleep(2)
-            else:
-                time.sleep(1)
+                logger.error(f"Waiting 0.3s for {canceled_count} cancellation(s) to process...")
+                time.sleep(0.3)
         else:
-            logger.error("No outstanding orders found")
+            logger.error("WARNING: get_all_open_orders() returned empty list - this may be incorrect!")
+            logger.error("Attempting to proceed with position closure anyway...")
     except Exception as e:
         logger.error(f"CRITICAL EXCEPTION in order cancellation: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        logger.error("Continuing with position closure despite error...")
-        time.sleep(2)  # Wait anyway
+        logger.error("Continuing with position closure...")
     
+    # ========================================================================
+    # STEP 2: SUBMIT ALL MARKET ORDERS TO CLOSE POSITIONS (FAST - NO DB WORK)
+    # ========================================================================
     logger.error("=" * 60)
-    logger.error("STEP 2: NOW CLOSING ALL POSITIONS")
+    logger.error("STEP 2: SUBMITTING MARKET ORDERS TO CLOSE POSITIONS")
     logger.error("=" * 60)
     
-    # Step 2: Close all positions
     positions = account_client.get_positions()
     if not positions:
         logger.info("No positions to close")
         return
     
-    logger.info(f"Closing {len(positions)} position(s)...")
+    logger.info(f"Submitting close orders for {len(positions)} position(s)...")
+    
+    # Store order info for database updates later
+    close_orders = []  # List of (symbol, order_id, long_qty, short_qty)
     
     for pos in positions:
         symbol = pos.get('instrument', {}).get('symbol')
-        long_qty = pos.get('longQuantity', 0)
-        short_qty = pos.get('shortQuantity', 0)
+        long_qty = pos.get('longQuantity', 0) or 0
+        short_qty = pos.get('shortQuantity', 0) or 0
         
         if not symbol:
             continue
         
-        # Get exit price before closing (for database update)
-        exit_price = None
-        if db_manager and market_data_client and db_manager.is_available():
-            try:
-                quote = market_data_client.get_quote(symbol)
-                if quote:
-                    exit_price = quote.get('lastPrice') or quote.get('last')
-            except Exception as e:
-                logger.debug(f"Could not get quote for {symbol}: {e}")
-        
         order_id = None
-        if long_qty > 0:
-            result = order_manager.create_market_order(symbol, "SELL", int(long_qty))
-            order_id = result.get('orderId') if isinstance(result, dict) else None
-            logger.info(f"Closed long position: {symbol} {long_qty} shares")
         
-        if short_qty > 0:
-            result = order_manager.create_market_order(symbol, "BUY_TO_COVER", int(short_qty))
-            order_id = result.get('orderId') if isinstance(result, dict) else None
-            logger.info(f"Closed short position: {symbol} {short_qty} shares")
+        # Submit market order to close position
+        try:
+            if long_qty > 0:
+                result = order_manager.create_market_order(symbol, "SELL", int(long_qty))
+                order_id = result.get('orderId') if isinstance(result, dict) else None
+                logger.info(f"  ✓ Submitted SELL order for {symbol}: {long_qty} shares (Order ID: {order_id})")
+            
+            if short_qty > 0:
+                result = order_manager.create_market_order(symbol, "BUY_TO_COVER", int(short_qty))
+                order_id = result.get('orderId') if isinstance(result, dict) else None
+                logger.info(f"  ✓ Submitted BUY_TO_COVER order for {symbol}: {short_qty} shares (Order ID: {order_id})")
+            
+            # Store for database update later
+            if order_id:
+                close_orders.append((symbol, order_id, long_qty, short_qty))
+        except Exception as e:
+            logger.error(f"  ✗ FAILED to submit close order for {symbol}: {e}")
+    
+    logger.info(f"Submitted {len(close_orders)} close order(s)")
+    
+    # ========================================================================
+    # STEP 3: UPDATE DATABASE AFTER ALL ORDERS ARE SUBMITTED
+    # ========================================================================
+    if db_manager and db_manager.is_available() and close_orders:
+        logger.error("=" * 60)
+        logger.error("STEP 3: UPDATING DATABASE WITH EXIT PRICES")
+        logger.error("=" * 60)
         
-        # CRITICAL: Always update trade in database, even if exit price retrieval fails
-        if db_manager and db_manager.is_available():
+        # Brief wait for orders to start filling (market orders fill quickly)
+        time.sleep(0.5)
+        
+        for symbol, order_id, long_qty, short_qty in close_orders:
+            exit_price = None
+            
             try:
-                from datetime import datetime
-                import pytz
-                
-                # Try to get exit price from order if available (more accurate than quote)
-                if order_id:
+                # Try to get exit price from order status (retry up to 5 times with increasing delays)
+                for attempt in range(5):
                     try:
                         order_status = order_manager.get_order_status(order_id)
                         
-                        # Check for error in response
                         if 'error' not in order_status:
-                            # Try top-level averageFillPrice first
-                            if 'averageFillPrice' in order_status:
-                                exit_price = float(order_status['averageFillPrice'])
-                                logger.debug(f"Got exit price from top-level averageFillPrice for {symbol}: ${exit_price:.2f}")
-                            # Try orderLegCollection (for stop loss orders, fill price is often here)
-                            elif 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
-                                leg = order_status['orderLegCollection'][0]
-                                # Check executionDetails first (most accurate for filled orders)
-                                if 'executionDetails' in leg and leg['executionDetails']:
-                                    executions = leg['executionDetails']
-                                    if executions:
-                                        # Calculate average fill price from all executions
-                                        total_price = 0
-                                        total_quantity = 0
-                                        for execution in executions:
-                                            if 'price' in execution and 'quantity' in execution:
-                                                total_price += execution['price'] * execution['quantity']
-                                                total_quantity += execution['quantity']
-                                        if total_quantity > 0:
-                                            exit_price = total_price / total_quantity
-                                            logger.debug(f"Got exit price from executionDetails for {symbol}: ${exit_price:.2f}")
-                                # Fallback to other leg fields
-                                if exit_price is None:
-                                    if 'averageFillPrice' in leg:
-                                        exit_price = float(leg['averageFillPrice'])
-                                        logger.debug(f"Got exit price from orderLegCollection averageFillPrice for {symbol}: ${exit_price:.2f}")
-                                    elif 'averagePrice' in leg:
-                                        exit_price = float(leg['averagePrice'])
-                                        logger.debug(f"Got exit price from orderLegCollection averagePrice for {symbol}: ${exit_price:.2f}")
-                                    elif 'filledPrice' in leg:
-                                        exit_price = float(leg['filledPrice'])
-                                        logger.debug(f"Got exit price from orderLegCollection filledPrice for {symbol}: ${exit_price:.2f}")
-                                    elif 'price' in leg:
-                                        exit_price = float(leg['price'])
-                                        logger.debug(f"Got exit price from orderLegCollection price for {symbol}: ${exit_price:.2f}")
-                            # Try top-level price
-                            elif 'price' in order_status:
-                                exit_price = float(order_status['price'])
-                                logger.debug(f"Got exit price from top-level price for {symbol}: ${exit_price:.2f}")
+                            status = order_status.get('status', '').upper()
+                            
+                            # Only try to get price if order is filled
+                            if status == 'FILLED':
+                                # Try orderActivityCollection first (most reliable for filled orders)
+                                if 'orderActivityCollection' in order_status and order_status['orderActivityCollection']:
+                                    activities = order_status['orderActivityCollection']
+                                    for activity in activities:
+                                        if 'executionLegs' in activity and activity['executionLegs']:
+                                            for leg in activity['executionLegs']:
+                                                if 'price' in leg:
+                                                    exit_price = float(leg['price'])
+                                                    logger.debug(f"Got exit price from orderActivityCollection for {symbol}: ${exit_price:.2f}")
+                                                    break
+                                        if exit_price:
+                                            break
+                                
+                                # Try top-level averageFillPrice
+                                if exit_price is None and 'averageFillPrice' in order_status:
+                                    exit_price = float(order_status['averageFillPrice'])
+                                    logger.debug(f"Got exit price from top-level averageFillPrice for {symbol}: ${exit_price:.2f}")
+                                
+                                # Try orderLegCollection
+                                if exit_price is None and 'orderLegCollection' in order_status and len(order_status['orderLegCollection']) > 0:
+                                    leg = order_status['orderLegCollection'][0]
+                                    if 'executionDetails' in leg and leg['executionDetails']:
+                                        executions = leg['executionDetails']
+                                        if executions:
+                                            total_price = 0
+                                            total_quantity = 0
+                                            for execution in executions:
+                                                if 'price' in execution and 'quantity' in execution:
+                                                    total_price += execution['price'] * execution['quantity']
+                                                    total_quantity += execution['quantity']
+                                            if total_quantity > 0:
+                                                exit_price = total_price / total_quantity
+                                                logger.debug(f"Got exit price from executionDetails for {symbol}: ${exit_price:.2f}")
+                                    
+                                    if exit_price is None:
+                                        if 'averageFillPrice' in leg:
+                                            exit_price = float(leg['averageFillPrice'])
+                                        elif 'price' in leg:
+                                            exit_price = float(leg['price'])
+                                
+                                if exit_price:
+                                    break
+                            elif status in ['WORKING', 'PENDING']:
+                                # Order not filled yet, wait longer
+                                logger.debug(f"Order {order_id} for {symbol} still {status}, waiting...")
+                            else:
+                                # Order in unexpected state
+                                logger.debug(f"Order {order_id} for {symbol} in state: {status}")
                     except Exception as e:
-                        logger.debug(f"Could not get exit price from order {order_id} for {symbol}: {e}")
+                        logger.debug(f"Attempt {attempt + 1}/5 failed to get exit price for {symbol}: {e}")
+                    
+                    if exit_price:
+                        break
+                    
+                    if attempt < 4:  # Don't sleep on last attempt
+                        # Increasing delay: 0.5s, 1s, 1.5s, 2s
+                        sleep_time = 0.5 * (attempt + 1)
+                        time.sleep(sleep_time)
                 
-                # Fallback: get current quote if we still don't have exit price
+                # Fallback: get current quote
                 if exit_price is None and market_data_client:
                     try:
                         quote = market_data_client.get_quote(symbol)
-                        if quote:
+                        if quote and isinstance(quote, (int, float)):
+                            exit_price = float(quote)
+                        elif quote and isinstance(quote, dict):
                             exit_price = quote.get('lastPrice') or quote.get('last')
+                            if exit_price:
+                                exit_price = float(exit_price)
                     except Exception as e:
                         logger.debug(f"Could not get quote for {symbol}: {e}")
                 
-                # Fallback: get entry price from database as last resort
-                if exit_price is None:
-                    try:
-                        cursor = db_manager.connection.cursor()
-                        find_query = "SELECT entry_price FROM trades WHERE ticker = %s AND is_closed = FALSE ORDER BY time_placed DESC LIMIT 1"
-                        cursor.execute(find_query, (symbol.upper(),))
-                        trade = cursor.fetchone()
-                        cursor.close()
-                        if trade and trade[0]:
-                            exit_price = float(trade[0])
-                            logger.warning(f"⚠️  Using entry price as fallback exit price for {symbol} (could not get actual exit price)")
-                    except Exception as e:
-                        logger.debug(f"Could not get entry price from database for {symbol}: {e}")
-                
-                # If we still don't have an exit price, use 0.0 as absolute last resort
-                # This ensures the trade is marked as closed, even if we can't get the price
+                # Fallback: use 0.0 (trade will be marked closed but P&L may be incorrect)
                 if exit_price is None:
                     exit_price = 0.0
-                    logger.error(f"❌ CRITICAL: Could not get exit price for {symbol} - using 0.0 as fallback. Trade will be marked as closed but P&L may be incorrect.")
+                    logger.error(f"❌ Could not get exit price for {symbol} - using 0.0 as fallback")
                 
-                db_manager.update_trade_on_close(
+                # Update database
+                update_success = db_manager.update_trade_on_close(
                     symbol,
                     exit_price,
                     datetime.now(pytz.UTC)
                 )
-                logger.info(f"✓ Updated trade {symbol} in database (exit price: ${exit_price:.2f})")
+                
+                if update_success:
+                    logger.info(f"✓ Updated {symbol} in database (exit price: ${exit_price:.2f})")
+                else:
+                    logger.warning(f"⚠️  Could not update {symbol} in database - no open trade found (exit price: ${exit_price:.2f})")
+                    # Trade may have been closed already or never logged - this is a data integrity issue
+                
             except Exception as e:
-                logger.error(f"❌ CRITICAL: Could not update trade {symbol} in database: {e}")
+                logger.error(f"❌ Failed to update {symbol} in database: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-        elif db_manager:
-            logger.warning(f"⚠️  Database not available - could not update trade {symbol} in database")
 
 
 def verify_stop_losses_for_all_positions(
@@ -878,6 +899,17 @@ def trading_loop(
                     )
                     break
                 
+                # Check and update trailing stop losses periodically during wait
+                # Update stop losses for positions that are up 1%+ to lock in gains
+                # Only updates again if price has moved up another 1% from last update
+                if strategy and hasattr(strategy, '_update_trailing_stop_losses'):
+                    try:
+                        updated = strategy._update_trailing_stop_losses()
+                        if updated > 0:
+                            logger.info(f"Trailing stop losses updated: {updated} position(s)")
+                    except Exception as e:
+                        logger.debug(f"Error updating trailing stop losses: {e}")
+                
                 # Check and log account size periodically during wait
                 now = datetime.now()
                 if now - last_account_check >= account_check_interval:
@@ -991,7 +1023,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    MAIN_LOOP_RETRY_DELAY_SECONDS = 60
+    MAIN_LOOP_RETRY_DELAY_SECONDS = 1  # Quick retry on errors
     
     # Main program loop
     while True:
