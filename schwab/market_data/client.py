@@ -3,7 +3,7 @@ Schwab Market Data API client.
 Handles market hours, quotes, and market data operations.
 """
 import requests
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 from datetime import datetime
 import pytz
 from loguru import logger
@@ -265,4 +265,66 @@ class MarketDataClient:
                 return None
         
         return None
+    
+    def get_quotes_batch(self, symbols: List[str], max_retries: int = 3) -> Dict[str, Dict]:
+        """
+        Get full quote data for multiple symbols in a single API call.
+        Much faster than calling get_quote_full multiple times.
+        
+        Args:
+            symbols: List of stock ticker symbols
+            max_retries: Maximum retry attempts
+        
+        Returns:
+            dict: Dictionary mapping symbol -> quote data (empty dict if error)
+        """
+        if not symbols:
+            return {}
+        
+        for attempt in range(max_retries):
+            try:
+                self._update_headers()
+                
+                url = f"{self.base_url}/quotes"
+                # Schwab API accepts comma-separated symbols
+                symbols_str = ','.join([s.upper() for s in symbols])
+                params = {
+                    'symbols': symbols_str
+                }
+                
+                response = requests.get(url, headers=self.headers, params=params, timeout=15)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # Response is a dict with symbols as keys
+                    result = {}
+                    for symbol in symbols:
+                        symbol_upper = symbol.upper()
+                        if symbol_upper in data:
+                            result[symbol_upper] = data[symbol_upper]
+                    logger.debug(f"Batch quote retrieved for {len(result)}/{len(symbols)} symbols")
+                    return result
+                elif response.status_code == 404:
+                    logger.debug(f"No quote data found for batch (404)")
+                    return {}
+                else:
+                    logger.warning(f"Failed to get batch quotes: {response.status_code} - {response.text}")
+                    if attempt < max_retries - 1:
+                        import time
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    return {}
+                    
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Network error getting batch quotes (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    import time
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return {}
+            except Exception as e:
+                logger.error(f"Error getting batch quotes: {e}")
+                return {}
+        
+        return {}
 

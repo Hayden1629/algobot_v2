@@ -254,12 +254,14 @@ class TradeExecutor:
                 'direction': direction
             }
     
-    def execute_trades(self, sized_trades: List[Dict]) -> List[Dict]:
+    def execute_trades(self, sized_trades: List[Dict], on_fill_callback=None) -> List[Dict]:
         """
         Execute multiple trades, check fills, and retry if needed.
         
         Args:
             sized_trades: List of sized trade dicts with 'ticker', 'direction', 'shares', 'price'
+            on_fill_callback: Optional callback function(ticker, direction, shares, entry_price, order_id) 
+                            called immediately when a trade fills, before retries
         
         Returns:
             list: List of execution results
@@ -309,6 +311,28 @@ class TradeExecutor:
                     if SHOW_ORDER_OUTPUT:
                         logger.info(f"✓ Order filled immediately for {ticker} (Order ID: {order_id})")
                     pending['result']['filled'] = True
+                    
+                    # Get actual fill price
+                    fill_price = pending['result'].get('price', 0)
+                    if 'averageFillPrice' in order_status:
+                        fill_price = float(order_status['averageFillPrice'])
+                    elif 'price' in order_status:
+                        fill_price = float(order_status['price'])
+                    pending['result']['price'] = fill_price
+                    
+                    # Call callback immediately to place stop loss (before retries)
+                    if on_fill_callback and fill_price > 0:
+                        try:
+                            on_fill_callback(
+                                ticker,
+                                pending['result'].get('direction', ''),
+                                pending['sized_trade'].get('shares', 0),
+                                fill_price,
+                                order_id
+                            )
+                        except Exception as e:
+                            logger.error(f"Error in on_fill_callback for {ticker}: {e}")
+                    
                     filled_immediately.append(pending)
             
             # Remove filled orders from pending list
@@ -336,10 +360,25 @@ class TradeExecutor:
                         # Update result to indicate fill
                         pending['result']['filled'] = True
                         # Get actual fill price if available
+                        fill_price = pending['result'].get('price', 0)
                         if 'averageFillPrice' in order_status:
-                            pending['result']['price'] = float(order_status['averageFillPrice'])
+                            fill_price = float(order_status['averageFillPrice'])
                         elif 'price' in order_status:
-                            pending['result']['price'] = float(order_status['price'])
+                            fill_price = float(order_status['price'])
+                        pending['result']['price'] = fill_price
+                        
+                        # Call callback immediately to place stop loss (before retries)
+                        if on_fill_callback and fill_price > 0:
+                            try:
+                                on_fill_callback(
+                                    ticker,
+                                    pending['result'].get('direction', ''),
+                                    pending['sized_trade'].get('shares', 0),
+                                    fill_price,
+                                    order_id
+                                )
+                            except Exception as e:
+                                logger.error(f"Error in on_fill_callback for {ticker}: {e}")
                     elif status in ['REJECTED', 'CANCELED', 'EXPIRED']:
                         logger.warning(f"Order {status} for {ticker}, will retry")
                         still_pending.append(pending)
@@ -380,6 +419,28 @@ class TradeExecutor:
                                 if SHOW_ORDER_OUTPUT:
                                     logger.info(f"✓ Order filled for {ticker} (Order ID: {old_order_id})")
                                 pending['result']['filled'] = True
+                                
+                                # Get actual fill price
+                                fill_price = pending['result'].get('price', 0)
+                                if 'averageFillPrice' in order_status:
+                                    fill_price = float(order_status['averageFillPrice'])
+                                elif 'price' in order_status:
+                                    fill_price = float(order_status['price'])
+                                pending['result']['price'] = fill_price
+                                
+                                # Call callback immediately to place stop loss (before retries)
+                                if on_fill_callback and fill_price > 0:
+                                    try:
+                                        on_fill_callback(
+                                            ticker,
+                                            pending['result'].get('direction', ''),
+                                            pending['sized_trade'].get('shares', 0),
+                                            fill_price,
+                                            old_order_id
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Error in on_fill_callback for {ticker}: {e}")
+                                
                                 filled_during_retry.append(pending)
                                 continue
                         
@@ -402,6 +463,29 @@ class TradeExecutor:
                                         if SHOW_ORDER_OUTPUT:
                                             logger.info(f"✓ Order for {ticker} was filled (cancel failed: order already filled)")
                                         pending['result']['filled'] = True
+                                        
+                                        # Get fill price from order status
+                                        fill_price = pending['result'].get('price', 0)
+                                        order_status = self.order_manager.get_order_status(old_order_id)
+                                        if 'averageFillPrice' in order_status:
+                                            fill_price = float(order_status['averageFillPrice'])
+                                        elif 'price' in order_status:
+                                            fill_price = float(order_status['price'])
+                                        pending['result']['price'] = fill_price
+                                        
+                                        # Call callback immediately to place stop loss (before retries)
+                                        if on_fill_callback and fill_price > 0:
+                                            try:
+                                                on_fill_callback(
+                                                    ticker,
+                                                    pending['result'].get('direction', ''),
+                                                    pending['sized_trade'].get('shares', 0),
+                                                    fill_price,
+                                                    old_order_id
+                                                )
+                                            except Exception as e:
+                                                logger.error(f"Error in on_fill_callback for {ticker}: {e}")
+                                        
                                         filled_during_retry.append(pending)
                                         continue
                             
@@ -410,6 +494,50 @@ class TradeExecutor:
                                 'BUY' if direction == 'LONG' else 'SELL_SHORT',
                                 sized_trade.get('shares', 0)
                             )
+                            
+                            # Market orders fill immediately - wait a moment then get fill price and place stop loss
+                            if 'orderId' in result or 'success' in result:
+                                new_order_id = result.get('orderId', result.get('order_id', 'unknown'))
+                                pending['result']['order_id'] = new_order_id
+                                
+                                import time
+                                time.sleep(0.5)  # Brief wait for market order to fill
+                                
+                                # Get fill price from order status
+                                fill_price = pending['result'].get('price', 0)
+                                order_status = self.order_manager.get_order_status(new_order_id)
+                                if order_status and 'averageFillPrice' in order_status:
+                                    fill_price = float(order_status['averageFillPrice'])
+                                elif order_status and 'price' in order_status:
+                                    fill_price = float(order_status['price'])
+                                elif order_status:
+                                    # Try to get from orderActivityCollection
+                                    if 'orderActivityCollection' in order_status and order_status['orderActivityCollection']:
+                                        for activity in order_status['orderActivityCollection']:
+                                            if 'executionLegs' in activity and activity['executionLegs']:
+                                                for leg in activity['executionLegs']:
+                                                    if 'price' in leg:
+                                                        fill_price = float(leg['price'])
+                                                        break
+                                
+                                pending['result']['price'] = fill_price
+                                pending['result']['filled'] = True
+                                
+                                # Call callback immediately to place stop loss
+                                if on_fill_callback and fill_price > 0:
+                                    try:
+                                        on_fill_callback(
+                                            ticker,
+                                            direction,
+                                            sized_trade.get('shares', 0),
+                                            fill_price,
+                                            new_order_id
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"Error in on_fill_callback for {ticker}: {e}")
+                                
+                                filled_during_retry.append(pending)
+                                continue
                         else:
                             # Cancel old order if still working
                             if old_order_id:
@@ -423,6 +551,29 @@ class TradeExecutor:
                                         if SHOW_ORDER_OUTPUT:
                                             logger.info(f"✓ Order for {ticker} was filled (cancel failed: order already filled)")
                                         pending['result']['filled'] = True
+                                        
+                                        # Get fill price from order status
+                                        fill_price = pending['result'].get('price', 0)
+                                        order_status = self.order_manager.get_order_status(old_order_id)
+                                        if 'averageFillPrice' in order_status:
+                                            fill_price = float(order_status['averageFillPrice'])
+                                        elif 'price' in order_status:
+                                            fill_price = float(order_status['price'])
+                                        pending['result']['price'] = fill_price
+                                        
+                                        # Call callback immediately to place stop loss (before retries)
+                                        if on_fill_callback and fill_price > 0:
+                                            try:
+                                                on_fill_callback(
+                                                    ticker,
+                                                    pending['result'].get('direction', ''),
+                                                    pending['sized_trade'].get('shares', 0),
+                                                    fill_price,
+                                                    old_order_id
+                                                )
+                                            except Exception as e:
+                                                logger.error(f"Error in on_fill_callback for {ticker}: {e}")
+                                        
                                         filled_during_retry.append(pending)
                                         # Don't place new order - this one is done
                                         continue
@@ -474,6 +625,28 @@ class TradeExecutor:
                 if status == 'FILLED':
                     logger.info(f"✓ Order filled for {ticker} (Order ID: {order_id})")
                     pending['result']['filled'] = True
+                    
+                    # Get actual fill price
+                    fill_price = pending['result'].get('price', 0)
+                    if 'averageFillPrice' in order_status:
+                        fill_price = float(order_status['averageFillPrice'])
+                    elif 'price' in order_status:
+                        fill_price = float(order_status['price'])
+                    pending['result']['price'] = fill_price
+                    
+                    # Call callback immediately to place stop loss
+                    if on_fill_callback and fill_price > 0:
+                        try:
+                            on_fill_callback(
+                                ticker,
+                                pending['result'].get('direction', ''),
+                                pending['sized_trade'].get('shares', 0),
+                                fill_price,
+                                order_id
+                            )
+                        except Exception as e:
+                            logger.error(f"Error in on_fill_callback for {ticker}: {e}")
+                    
                     final_filled.append(pending)
                     continue
                 
@@ -486,6 +659,29 @@ class TradeExecutor:
                     if 'FILLED' in error_msg and ('CANNOT' in error_msg or 'CANNOT BE CANCELED' in error_msg):
                         logger.info(f"✓ Order for {ticker} was filled (cancel failed: order already filled)")
                         pending['result']['filled'] = True
+                        
+                        # Get fill price from order status
+                        fill_price = pending['result'].get('price', 0)
+                        order_status = self.order_manager.get_order_status(order_id)
+                        if 'averageFillPrice' in order_status:
+                            fill_price = float(order_status['averageFillPrice'])
+                        elif 'price' in order_status:
+                            fill_price = float(order_status['price'])
+                        pending['result']['price'] = fill_price
+                        
+                        # Call callback immediately to place stop loss
+                        if on_fill_callback and fill_price > 0:
+                            try:
+                                on_fill_callback(
+                                    ticker,
+                                    pending['result'].get('direction', ''),
+                                    pending['sized_trade'].get('shares', 0),
+                                    fill_price,
+                                    order_id
+                                )
+                            except Exception as e:
+                                logger.error(f"Error in on_fill_callback for {ticker}: {e}")
+                        
                         final_filled.append(pending)
                         continue
                 
@@ -502,8 +698,45 @@ class TradeExecutor:
                 if 'orderId' in result or 'success' in result:
                     if SHOW_ORDER_OUTPUT:
                         logger.info(f"✓ Market order placed for {ticker}")
+                    new_order_id = result.get('orderId', result.get('order_id', 'unknown'))
+                    pending['result']['order_id'] = new_order_id
+                    
+                    # Market orders fill immediately - wait a moment then get fill price
+                    import time
+                    time.sleep(0.5)  # Brief wait for market order to fill
+                    
+                    # Get fill price from order status
+                    fill_price = pending['result'].get('price', 0)
+                    order_status = self.order_manager.get_order_status(new_order_id)
+                    if order_status and 'averageFillPrice' in order_status:
+                        fill_price = float(order_status['averageFillPrice'])
+                    elif order_status and 'price' in order_status:
+                        fill_price = float(order_status['price'])
+                    elif order_status:
+                        # Try to get from orderActivityCollection
+                        if 'orderActivityCollection' in order_status and order_status['orderActivityCollection']:
+                            for activity in order_status['orderActivityCollection']:
+                                if 'executionLegs' in activity and activity['executionLegs']:
+                                    for leg in activity['executionLegs']:
+                                        if 'price' in leg:
+                                            fill_price = float(leg['price'])
+                                            break
+                    
+                    pending['result']['price'] = fill_price
                     pending['result']['filled'] = True
-                    pending['result']['order_id'] = result.get('orderId', result.get('order_id', 'unknown'))
+                    
+                    # Call callback immediately to place stop loss
+                    if on_fill_callback and fill_price > 0:
+                        try:
+                            on_fill_callback(
+                                ticker,
+                                direction,
+                                sized_trade.get('shares', 0),
+                                fill_price,
+                                new_order_id
+                            )
+                        except Exception as e:
+                            logger.error(f"Error in on_fill_callback for {ticker}: {e}")
                 else:
                     logger.error(f"✗ Market order failed for {ticker}: {result.get('error', 'Unknown error')}")
                     pending['result']['success'] = False

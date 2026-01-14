@@ -343,6 +343,10 @@ class RollingStrategy:
             
             logger.debug(f"Checking {len(positions)} positions for trailing stop loss updates...")
             
+            # Collect all tickers for batch quote fetch
+            position_info = []
+            tickers_to_check = []
+            
             for pos in positions:
                 try:
                     instrument = pos.get('instrument', {})
@@ -381,8 +385,7 @@ class RollingStrategy:
                     cursor.close()
                     
                     if not trade or not trade[0]:
-                        # Trade not in database - this is a data integrity issue but not critical for trailing stops
-                        # Skip silently to reduce log noise (this happens when trades aren't logged on open)
+                        # Trade not in database - skip silently
                         continue
                     
                     entry_price = float(trade[0])
@@ -393,10 +396,39 @@ class RollingStrategy:
                         logger.debug(f"Direction mismatch for {ticker}: DB={db_action}, Position={direction}")
                         continue
                     
-                    # Get current price
-                    quote_data = self.market_data_client.get_quote_full(ticker)
+                    # Store position info for batch processing
+                    position_info.append({
+                        'ticker': ticker,
+                        'direction': direction,
+                        'quantity': quantity,
+                        'stop_instruction': stop_instruction,
+                        'entry_price': entry_price
+                    })
+                    tickers_to_check.append(ticker)
+                    
+                except Exception as e:
+                    logger.debug(f"Error processing position for trailing stop: {e}")
+                    continue
+            
+            if not tickers_to_check:
+                return 0
+            
+            # Batch fetch quotes for all positions at once (much faster)
+            batch_quotes = self.market_data_client.get_quotes_batch(tickers_to_check)
+            
+            # Process each position with its quote data
+            for pos_info in position_info:
+                try:
+                    ticker = pos_info['ticker']
+                    direction = pos_info['direction']
+                    quantity = pos_info['quantity']
+                    stop_instruction = pos_info['stop_instruction']
+                    entry_price = pos_info['entry_price']
+                    
+                    # Get current price from batch quotes
+                    quote_data = batch_quotes.get(ticker) if batch_quotes else None
                     if not quote_data:
-                        logger.debug(f"Could not get quote for {ticker}")
+                        logger.debug(f"Could not get quote for {ticker} from batch")
                         continue
                     
                     current_price = (
@@ -1159,11 +1191,47 @@ class RollingStrategy:
                         
                         if sized_trades:
                             logger.info(f"Executing {len(sized_trades)} trade(s)...")
-                            # Execute the trades
-                            execution_results = self.trade_executor.execute_trades(sized_trades)
                             
-                            # Track successful trades and place stop loss orders
+                            # Define callback to place stop loss immediately when trade fills
+                            def on_trade_fill(ticker: str, direction: str, shares: int, entry_price: float, order_id: str):
+                                """Place stop loss order immediately when a trade fills."""
+                                ticker_upper = ticker.upper()
+                                direction_upper = direction.upper()
+                                
+                                # Track the trade immediately
+                                self.trade_tracker.add_trade(ticker_upper)
+                                if SHOW_ORDER_OUTPUT:
+                                    logger.debug(f"Tracking new trade: {ticker_upper} ({direction_upper}, {shares} shares)")
+                                
+                                # Place stop loss order IMMEDIATELY (critical for risk management)
+                                if entry_price > 0:
+                                    if direction_upper == 'LONG':
+                                        stop_instruction = 'SELL'
+                                    else:  # SHORT
+                                        stop_instruction = 'BUY_TO_COVER'
+                                    
+                                    stop_loss_result = self.order_manager.create_stop_loss_order(
+                                        ticker_upper,
+                                        stop_instruction,
+                                        shares,
+                                        entry_price,
+                                        STOP_LOSS_PERCENT
+                                    )
+                                    
+                                    if stop_loss_result.get('orderId') or stop_loss_result.get('success'):
+                                        stop_loss_order_id = stop_loss_result.get('orderId', stop_loss_result.get('order_id', 'unknown'))
+                                        self.trade_tracker.set_stop_loss_order_id(ticker_upper, stop_loss_order_id)
+                                        logger.info(f"✓ Stop loss placed IMMEDIATELY for {ticker_upper} (Order ID: {stop_loss_order_id}, {STOP_LOSS_PERCENT}% loss)")
+                                    else:
+                                        logger.warning(f"Failed to place stop loss order for {ticker_upper}: {stop_loss_result.get('error', 'Unknown error')}")
+                            
+                            # Execute the trades with callback for immediate stop loss placement
+                            execution_results = self.trade_executor.execute_trades(sized_trades, on_fill_callback=on_trade_fill)
+                            
+                            # Collect trades for bulk database insert (non-critical, done after execution)
                             successful_trades = 0
+                            trades_to_insert = []
+                            
                             for result in execution_results:
                                 if result.get('success') and result.get('filled'):
                                     successful_trades += 1
@@ -1173,55 +1241,45 @@ class RollingStrategy:
                                     entry_price = result.get('price', 0)
                                     order_id = result.get('order_id', 'unknown')
                                     
-                                    # Track the trade
-                                    if ticker:
-                                        self.trade_tracker.add_trade(ticker)
-                                        if SHOW_ORDER_OUTPUT:
-                                            logger.debug(f"Tracking new trade: {ticker} ({direction}, {shares} shares)")
-                                        
-                                        # Insert trade to database
-                                        if self.db_manager and self.db_manager.is_available() and entry_price > 0:
-                                            from datetime import datetime
-                                            import pytz
-                                            trade_data = {
-                                                'ticker': ticker,
-                                                'action': direction,
-                                                'quantity': shares,
-                                                'entry_price': entry_price,
-                                                'exit_price': None,
-                                                'profit_loss': None,
-                                                'profit_loss_percent': None,
-                                                'time_placed': datetime.now(pytz.UTC),
-                                                'close_time': None,
-                                                'order_id': str(order_id),
-                                                'is_closed': False
-                                            }
+                                    # Collect trade data for bulk insert
+                                    if self.db_manager and self.db_manager.is_available() and entry_price > 0:
+                                        from datetime import datetime
+                                        import pytz
+                                        trade_data = {
+                                            'ticker': ticker,
+                                            'action': direction,
+                                            'quantity': shares,
+                                            'entry_price': entry_price,
+                                            'exit_price': None,
+                                            'profit_loss': None,
+                                            'profit_loss_percent': None,
+                                            'time_placed': datetime.now(pytz.UTC),
+                                            'close_time': None,
+                                            'order_id': str(order_id),
+                                            'is_closed': False
+                                        }
+                                        trades_to_insert.append(trade_data)
+                            
+                            # Bulk insert all trades to database (faster than sequential)
+                            if trades_to_insert:
+                                try:
+                                    trade_db_ids = self.db_manager.bulk_insert_trades(trades_to_insert)
+                                    successful_db_inserts = sum(1 for tid in trade_db_ids if tid is not None)
+                                    logger.info(f"Bulk inserted {successful_db_inserts}/{len(trades_to_insert)} trades to database")
+                                    if SHOW_ORDER_OUTPUT:
+                                        for i, trade_data in enumerate(trades_to_insert):
+                                            if trade_db_ids[i]:
+                                                logger.debug(f"Trade inserted to database: {trade_data['ticker']} (DB ID: {trade_db_ids[i]})")
+                                except Exception as e:
+                                    logger.error(f"Error bulk inserting trades: {e}")
+                                    # Fallback to individual inserts if bulk fails
+                                    for trade_data in trades_to_insert:
+                                        try:
                                             trade_db_id = self.db_manager.insert_trade(trade_data)
                                             if trade_db_id:
-                                                logger.debug(f"Trade inserted to database: {ticker} (DB ID: {trade_db_id})")
-                                    
-                                    # Place stop loss order
-                                    if entry_price > 0:
-                                        if direction == 'LONG':
-                                            stop_instruction = 'SELL'
-                                        else:  # SHORT
-                                            stop_instruction = 'BUY_TO_COVER'
-                                        
-                                        stop_loss_result = self.order_manager.create_stop_loss_order(
-                                            ticker,
-                                            stop_instruction,
-                                            shares,
-                                            entry_price,
-                                            STOP_LOSS_PERCENT
-                                        )
-                                        
-                                        if stop_loss_result.get('orderId') or stop_loss_result.get('success'):
-                                            stop_loss_order_id = stop_loss_result.get('orderId', stop_loss_result.get('order_id', 'unknown'))
-                                            self.trade_tracker.set_stop_loss_order_id(ticker, stop_loss_order_id)
-                                            if SHOW_ORDER_OUTPUT:
-                                                logger.info(f"✓ Stop loss order placed for {ticker} (Order ID: {stop_loss_order_id}, {STOP_LOSS_PERCENT}% loss)")
-                                        else:
-                                            logger.warning(f"Failed to place stop loss order for {ticker}: {stop_loss_result.get('error', 'Unknown error')}")
+                                                logger.debug(f"Trade inserted to database: {trade_data['ticker']} (DB ID: {trade_db_id})")
+                                        except Exception as e2:
+                                            logger.error(f"Failed to insert trade for {trade_data['ticker']}: {e2}")
                             
                             logger.info(f"Successfully executed {successful_trades}/{len(sized_trades)} trade(s)")
                             results['trades_opened'] = successful_trades

@@ -226,6 +226,116 @@ class DatabaseManager:
                 pass
             return None
     
+    def bulk_insert_trades(self, trades_data: List[Dict[str, Any]]) -> List[int]:
+        """
+        Bulk insert multiple trades into the database in a single transaction.
+        Much faster than inserting one by one.
+        
+        Args:
+            trades_data: List of trade dictionaries (same format as insert_trade)
+        
+        Returns:
+            list: List of trade IDs (None for failed inserts)
+        """
+        if not self.is_available():
+            return [None] * len(trades_data)
+        
+        if not trades_data:
+            return []
+        
+        self._reconnect_if_needed()
+        
+        trade_ids = []
+        
+        try:
+            cursor = self.connection.cursor()
+            
+            trade_insert = """
+                INSERT INTO trades (
+                    ticker, action, quantity, entry_price, exit_price,
+                    profit_loss, profit_loss_percent, time_placed, close_time,
+                    hold_time_minutes, order_id, is_closed
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            trade_values_list = []
+            
+            for trade_data in trades_data:
+                # Parse timestamps
+                time_placed = trade_data.get('time_placed')
+                if isinstance(time_placed, str):
+                    time_placed = datetime.fromisoformat(time_placed.replace('Z', '+00:00'))
+                if time_placed and time_placed.tzinfo is None:
+                    time_placed = pytz.UTC.localize(time_placed)
+                elif time_placed:
+                    time_placed = time_placed.astimezone(pytz.UTC)
+                
+                close_time = trade_data.get('close_time')
+                if isinstance(close_time, str):
+                    close_time = datetime.fromisoformat(close_time.replace('Z', '+00:00'))
+                if close_time and close_time.tzinfo is None:
+                    close_time = pytz.UTC.localize(close_time)
+                elif close_time:
+                    close_time = close_time.astimezone(pytz.UTC)
+                
+                # Calculate hold time if both times are available
+                hold_time_minutes = None
+                if time_placed and close_time:
+                    hold_time_minutes = (close_time - time_placed).total_seconds() / 60.0
+                
+                # Determine if trade is closed
+                is_closed = close_time is not None
+                
+                trade_values = (
+                    trade_data.get('ticker'),
+                    trade_data.get('action'),
+                    trade_data.get('quantity'),
+                    trade_data.get('entry_price'),
+                    trade_data.get('exit_price'),
+                    trade_data.get('profit_loss'),
+                    trade_data.get('profit_loss_percent'),
+                    time_placed,
+                    close_time,
+                    hold_time_minutes,
+                    trade_data.get('order_id'),
+                    is_closed
+                )
+                
+                trade_values_list.append(trade_values)
+            
+            # Execute bulk insert
+            cursor.executemany(trade_insert, trade_values_list)
+            
+            # Get all inserted IDs
+            first_id = cursor.lastrowid
+            num_inserted = cursor.rowcount
+            
+            # MySQL returns the first ID, subsequent IDs are sequential
+            trade_ids = [first_id + i for i in range(num_inserted)]
+            
+            self.connection.commit()
+            cursor.close()
+            
+            logger.debug(f"Bulk inserted {len(trade_ids)} trades successfully (IDs: {trade_ids[0]}-{trade_ids[-1]})")
+            return trade_ids
+            
+        except Error as e:
+            logger.error(f"❌ CRITICAL: Error bulk inserting trades: {e}")
+            logger.error(f"   Attempted to insert {len(trades_data)} trades")
+            try:
+                self.connection.rollback()
+            except:
+                pass
+            return [None] * len(trades_data)
+        except Exception as e:
+            logger.error(f"❌ CRITICAL: Unexpected error bulk inserting trades: {e}")
+            logger.error(f"   Attempted to insert {len(trades_data)} trades")
+            try:
+                self.connection.rollback()
+            except:
+                pass
+            return [None] * len(trades_data)
+    
     def update_trade_on_close(self, ticker: str, exit_price: float, close_time: Optional[datetime] = None) -> bool:
         """
         Update a trade record when it is closed.

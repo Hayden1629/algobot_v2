@@ -854,7 +854,8 @@ def trading_loop(
             else:
                 logger.warning(f"Cycle had errors: {results.get('errors', [])}")
             
-            # Verify all positions have stop loss orders before waiting
+            # CRITICAL: Verify all positions have stop loss orders IMMEDIATELY after execution
+            # This must happen before database operations to ensure risk management is in place
             verify_stop_losses_for_all_positions(account_client, order_manager, trade_tracker)
             
             # Wait before next cycle with periodic checks
@@ -870,7 +871,7 @@ def trading_loop(
             logger.warning(f"   Wait started at {wait_start_time.strftime('%H:%M:%S')}, will end at {wait_end_time.strftime('%H:%M:%S')}")
             
             # Check interval for monitoring (smaller chunks for more responsive checks)
-            check_interval = 30  # Check every 30 seconds
+            check_interval = 10  # Check every 10 seconds (reduced from 30 for faster drawdown detection)
             
             while datetime.now() < wait_end_time:
                 # Calculate remaining time
