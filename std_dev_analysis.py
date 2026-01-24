@@ -47,6 +47,7 @@ def get_std_dev(symbol: str, start_date: datetime, end_date: datetime, multiplie
     return annualized_std_dev
 
 if __name__ == "__main__":
+    print(MASSIVE_API_KEY)
     data = pd.read_csv("/home/hayden/code/algobot_v2/prt_trade_analysis.csv")
     tickers_series_unique = data['ticker'].unique()
     print(tickers_series_unique)
